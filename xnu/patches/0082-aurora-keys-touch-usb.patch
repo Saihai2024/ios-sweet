@@ -208,7 +208,7 @@ index 4da50d8..7af1445 100644
  	}
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..90a448f 100644
+index 03defe6..b127608 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -20,6 +20,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -379,7 +379,7 @@ index 03defe6..90a448f 100644
  	touch_wr(st.se, 0x810, 0);
  	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
  	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
-@@ -545,6 +575,410 @@ touch_se_init(void)
+@@ -545,6 +575,431 @@ touch_se_init(void)
  	return true;
  }
  
@@ -391,6 +391,7 @@ index 03defe6..90a448f 100644
 +#define TCM_PAYLOAD_MAX  1024u
 +#define TCM_CMD_CONTINUE 0x01u
 +#define TCM_CMD_IDENTIFY 0x02u
++#define TCM_CMD_BOOT_INFO 0x10u
 +#define TCM_CMD_RUN_APP  0x14u
 +#define TCM_CMD_APP_INFO 0x20u
 +#define TCM_CMD_GET_CFG  0x25u
@@ -650,12 +651,32 @@ index 03defe6..90a448f 100644
 +	    tcm.code, tcm.len, p[0], p[1], (const char *)(p + 2), p[18], p[19], p[20], p[21],
 +	    tcm.max_write);
 +	if (p[1] != 1u) {
-+		printf("SWEET TOUCH: not in application mode; RUN_APPLICATION_FIRMWARE\n");
-+		if (tcm_cmd(TCM_CMD_RUN_APP, NULL, 0, 3000) || tcm.code != TCM_REP_IDENTIFY ||
-+		    tcm.msg[5] != 1u) {
++		/* Bootloader: dump boot info (status 0xfe = bad app fw, 0xfd/0xfc = display cfg). */
++		if (!tcm_cmd(TCM_CMD_BOOT_INFO, NULL, 0, 1000)) {
++			const uint8_t *b = tcm.msg + 4;
++			printf("SWEET TOUCH: BOOT ver=%u status=%#x asic=%02x%02x reset-reason=%#x pc=%02x%02x len=%u\n",
++			    b[0], b[1], b[2], b[3], b[8], b[10], b[9], tcm.len);
++		}
++		bool app = false;
++		for (unsigned i = 0; i < 3 && !app; ++i) {
++			printf("SWEET TOUCH: not in application mode; RUN_APPLICATION_FIRMWARE #%u\n", i);
++			int err = tcm_cmd(TCM_CMD_RUN_APP, NULL, 0, 3000);
++			if (err) {
++				printf("SWEET TOUCH: run-app err=%d len=%u payload=%02x %02x %02x %02x\n", err,
++				    tcm.len, tcm.msg[4], tcm.msg[5], tcm.msg[6], tcm.msg[7]);
++			}
++			/* The app announces itself with an identify report; give it time. */
++			touch_wait(200);
++			if ((tcm_wait_identify(500) || !tcm_cmd(TCM_CMD_IDENTIFY, NULL, 0, 1000)) &&
++			    tcm.len >= 2 && tcm.msg[5] == 1u) {
++				app = true;
++			}
++		}
++		if (!app) {
 +			printf("SWEET TOUCH: application firmware did not start (mode=%u)\n", tcm.msg[5]);
 +			return false;
 +		}
++		printf("SWEET TOUCH: application firmware running\n");
 +	}
 +	if (tcm_cmd(TCM_CMD_APP_INFO, NULL, 0, 1000) || tcm.len < 46) {
 +		printf("SWEET TOUCH: GET_APPLICATION_INFO failed len=%u\n", tcm.len);
@@ -790,7 +811,7 @@ index 03defe6..90a448f 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -558,6 +992,16 @@ touch_thread(void *arg, wait_result_t result)
+@@ -558,6 +1013,16 @@ touch_thread(void *arg, wait_result_t result)
  	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
  	printf("SWEET TOUCH: starting in %u s\n", delay_s);
  	touch_wait(delay_s * 1000u);
