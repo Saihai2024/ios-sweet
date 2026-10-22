@@ -208,7 +208,7 @@ index 4da50d8..7af1445 100644
  	}
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..bb7e204 100644
+index 03defe6..90a448f 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -20,6 +20,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -248,7 +248,7 @@ index 03defe6..bb7e204 100644
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
  	int x[TOUCH_MAX], y[TOUCH_MAX];
-@@ -137,34 +150,40 @@ static bool
+@@ -137,34 +150,45 @@ static bool
  touch_clocks(void)
  {
  	/* Vote on only wrapper1 and SE7, preserving other clock users. */
@@ -300,13 +300,18 @@ index 03defe6..bb7e204 100644
 -			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
 -			    touch_rd(st.gcc, branches[i]));
 +	for (unsigned i = 0; i < st.nbranches; ++i) {
++		/* HW_CTL (bit 1): hardware gating may report CLK_OFF while idle; Linux
++		 * clk-branch skips the halt check in this mode. */
++		if (touch_rd(st.gcc, st.branches[i]) & 2u) {
++			continue;
++		}
 +		if (!touch_wait_clear(st.gcc, st.branches[i], 1u << 31)) {
 +			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", st.branches[i],
 +			    touch_rd(st.gcc, st.branches[i]));
  			return false;
  		}
  	}
-@@ -209,12 +228,12 @@ touch_irq(void)
+@@ -209,12 +233,12 @@ touch_irq(void)
  	return st.irq_last;
  }
  
@@ -321,7 +326,7 @@ index 03defe6..bb7e204 100644
  		return EIO;
  	}
  	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
-@@ -227,7 +246,8 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -227,7 +251,8 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
  	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
  	int err = ETIMEDOUT;
@@ -331,7 +336,7 @@ index 03defe6..bb7e204 100644
  		uint32_t irq = touch_irq();
  		if (irq & SE_ERRORS) {
  			err = (irq & SE_NACK) ? ENXIO : EIO;
-@@ -246,14 +266,18 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -246,14 +271,18 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
  			}
  			break;
  		}
@@ -357,7 +362,7 @@ index 03defe6..bb7e204 100644
  		}
  		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
  		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
-@@ -515,7 +539,7 @@ touch_se_init(void)
+@@ -515,7 +544,7 @@ touch_se_init(void)
  	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
  	touch_wr(st.se, 0x24, 0x7f);
  	touch_wr(st.se, 0x20, 1);
@@ -366,7 +371,7 @@ index 03defe6..bb7e204 100644
  	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
  	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
  	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
-@@ -525,6 +549,7 @@ touch_se_init(void)
+@@ -525,6 +554,7 @@ touch_se_init(void)
  	touch_wr(st.se, 0x284, SE_PACK0);
  	touch_wr(st.se, 0x288, SE_PACK1);
  	touch_wr(st.se, SE_TX_WM, 0);
@@ -374,7 +379,7 @@ index 03defe6..bb7e204 100644
  	touch_wr(st.se, 0x810, 0);
  	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
  	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
-@@ -545,6 +570,410 @@ touch_se_init(void)
+@@ -545,6 +575,410 @@ touch_se_init(void)
  	return true;
  }
  
@@ -785,7 +790,7 @@ index 03defe6..bb7e204 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -558,6 +987,16 @@ touch_thread(void *arg, wait_result_t result)
+@@ -558,6 +992,16 @@ touch_thread(void *arg, wait_result_t result)
  	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
  	printf("SWEET TOUCH: starting in %u s\n", delay_s);
  	touch_wait(delay_s * 1000u);
