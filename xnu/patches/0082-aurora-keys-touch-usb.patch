@@ -1,0 +1,873 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..74b996a 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern bool sweet_is_sm8250(void);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -26,6 +27,10 @@ void sweet_keys_init(void);
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++/* aurora (SM8250): vol+ = PM8150 GPIO6 (0xc500), vol- = GPIO7 (0xc600). */
++static uint16_t keys_down_apid = KEYS_NO_APID;
++static uint16_t keys_gpio_base = 0xc100u, keys_down_base = 0xc600u;
++static bool keys_aurora;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -81,6 +86,20 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++static bool
++keys_gpio_ok(uint16_t apid, uint16_t base)
++{
++	uint8_t mode = 0, en = 0, subtype = 0;
++	bool mok = keys_read(apid, base + 0x40u, &mode);
++	bool eok = keys_read(apid, base + 0x46u, &en);
++	bool sok = keys_read(apid, base + 0x05u, &subtype);
++	printf("SWEET KEYS: gpio %#x apid=%u mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    base, apid, mode, mok, en, eok, subtype, sok);
++	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
++	    mode & 3u : (mode >> 4) & 7u;
++	return eok && mok && sok && (en & 0x80u) && (dir == 0 || dir == 2);
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -98,11 +117,13 @@ keys_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
++		uint8_t pon = 0, gpio = 0, down = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		bool gok = keys_read(keys_gpio_apid, keys_gpio_base + 0x10u, &gpio);
++		bool dok = keys_aurora && keys_read(keys_down_apid, keys_down_base + 0x10u, &down);
++		int now[3] = {!!(pon & 1u), !(gpio & 1u),
++		    keys_aurora ? !(down & 1u) : !!(pon & 2u)};
++		if (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+ 				    pok, gok, keys_last_status);
+@@ -111,7 +132,8 @@ keys_thread(void *arg, wait_result_t result)
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			bool ok = k == 1 ? gok : (k == 2 && keys_aurora ? dok : pok);
++			if (ok && now[k] != state[k]) {
+ 				state[k] = now[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+@@ -151,23 +173,30 @@ sweet_keys_init(void)
+ 		    keys_version, count);
+ 		return;
+ 	}
++	keys_aurora = sweet_is_sm8250();
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	if (keys_aurora) {
++		keys_gpio_base = 0xc500u;
++		keys_gpio_apid = keys_find_apid(0x0c5, count);
++		keys_down_apid = keys_find_apid(0x0c6, count);
++	} else {
++		keys_gpio_apid = keys_find_apid(0x4c1, count);
++	}
++	uint8_t pon = 0, gpio = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
++	bool gok = keys_read(keys_gpio_apid, keys_gpio_base + 0x10u, &gpio);
++	printf("SWEET KEYS: arb=%#x apids=%u aurora=%d pon-apid=%u up-apid=%u down-apid=%u pon=%#x/%d gpio=%#x/%d\n",
++	    keys_version, count, keys_aurora, keys_pon_apid, keys_gpio_apid,
++	    keys_down_apid, pon, pok, gpio, gok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++	if (!keys_gpio_ok(keys_gpio_apid, keys_gpio_base)) {
++		printf("SWEET KEYS: vol+ GPIO not confirmed input; withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
++		gok = false;
++	}
++	if (keys_aurora && !keys_gpio_ok(keys_down_apid, keys_down_base)) {
++		printf("SWEET KEYS: vol- GPIO not confirmed input; withheld, PMIC unchanged\n");
++		keys_down_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..7af1445 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,9 +9,41 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++bool sweet_is_sm8250(void);
++
++/*
++ * The same kernel runs on sweet (SM7150) and aurora (OnePlus 9R, SM8250);
++ * mkadt.py --aurora puts "qcom,sm8250" in the root compatible list.
++ */
++bool
++sweet_is_sm8250(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		DTEntry root;
++		const char *compat = NULL;
++		unsigned size = 0;
++		cached = 0;
++		if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess &&
++		    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) == kSuccess) {
++			for (unsigned i = 0; i < size;) {
++				if (!strncmp(compat + i, "qcom,sm8250", size - i)) {
++					cached = 1;
++					break;
++				}
++				while (i < size && compat[i]) {
++					++i;
++				}
++				++i;
++			}
++		}
++	}
++	return cached == 1;
++}
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -131,6 +163,12 @@ rh_map(void)
+ 	if (!rh_db) {
+ 		uint32_t pa = rh_read(rh_dict, 0);
+ 		uint32_t size = rh_read(rh_dict, 4);
++		if (sweet_is_sm8250()) {
++			/* aurora DT: reserved-memory@80860000 "qcom,cmd-db", 0x20000. */
++			printf("SWEET RPMH: aurora AOP locator pa=%#x size=%#x (using DT region)\n", pa, size);
++			pa = 0x80860000u;
++			size = 0x20000u;
++		}
+ 		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+@@ -234,7 +272,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -320,16 +358,20 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %#x ACTIVE vote complete (rail voltage requires hardware verification)\n", address);
+ 	return 0;
+ }
+ 
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources.
++	 * sweet: L11C (touch). aurora: L13A 3.008 V and L1C 1.8 V (S3908 touch). */
++	bool ok = res && ((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
++	    (!strcmp(res, "ldoa13") && mv >= 2950 && mv <= 3100) ||
++	    (!strcmp(res, "ldoc1") && mv >= 1750 && mv <= 1850));
++	if (!ok) {
++		printf("SWEET RPMH: refusing %s %u mV\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..bb7e204 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -20,6 +20,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool sweet_is_sm8250(void);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -27,6 +28,15 @@ void sweet_touch_init(void);
+ #define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+ #define TOUCH_GCC_VOTE   0x5200cu
+ #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++/* aurora (OnePlus 9R, SM8250): S3908 TCM @0x4b on i2c@a94000 (wrap1 SE5 =
++ * QUP13), SDA/SCL gpio36/37 (qup13, func 1), reset gpio38, IRQ gpio39 (level
++ * low), all in the SOUTH TLMM tile. Supplies: L13A 3.008 V, L1C 1.8 V. */
++#define AUR_SE_PA        0x00a94000u
++#define AUR_SOUTH_PA     0x0f500000u
++#define AUR_GCC_VOTE     0x52008u
++#define AUR_RCG          0x18600u
++#define AUR_ADDR         0x4bu
++#define TCM_MAX_XFER     512u
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+@@ -73,8 +83,11 @@ void sweet_touch_init(void);
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
++	uint32_t vote, vote_mask, rcg;
++	const uint32_t *branches;
++	unsigned nbranches, tx_depth;
+ 	bool started, dead, probing;
+-	int kind, irq_hint;
++	int kind, irq_hint, clk_level;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+@@ -137,34 +150,40 @@ static bool
+ touch_clocks(void)
+ {
+ 	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	touch_wr(st.gcc, st.vote, touch_rd(st.gcc, st.vote) | st.vote_mask);
++	uint32_t dfs = touch_rd(st.gcc, st.rcg + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, st.rcg + 4u);
+ 	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	    touch_rd(st.gcc, st.vote), touch_rd(st.gcc, st.rcg), cfg, dfs);
+ 	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++		/* SE CLK_SEL picks a DFS performance level. Use one that is XO/1 with
++		 * no M/N (19.2 MHz); do not alter the tables. */
++		st.clk_level = -1;
++		for (unsigned l = 0; l < 8; ++l) {
++			cfg = touch_rd(st.gcc, st.rcg + 0x1cu + 4u * l);
++			printf("SWEET TOUCH: DFS level%u cfg=%#x\n", l, cfg);
++			if (st.clk_level < 0 && (cfg & 0x371fu) == 1u) {
++				st.clk_level = (int)l;
++			}
++		}
++		if (st.clk_level < 0) {
++			printf("SWEET TOUCH: no XO/1 DFS level; need clock integration\n");
+ 			return false;
+ 		}
+ 	} else {
+ 		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+ 		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++		touch_wr(st.gcc, st.rcg + 4u, cfg);
++		touch_wr(st.gcc, st.rcg, touch_rd(st.gcc, st.rcg) | 1u);
++		if (!touch_wait_clear(st.gcc, st.rcg, 1u)) {
+ 			printf("SWEET TOUCH: RCG update timeout\n");
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
++	for (unsigned i = 0; i < st.nbranches; ++i) {
++		if (!touch_wait_clear(st.gcc, st.branches[i], 1u << 31)) {
++			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", st.branches[i],
++			    touch_rd(st.gcc, st.branches[i]));
+ 			return false;
+ 		}
+ 	}
+@@ -209,12 +228,12 @@ touch_irq(void)
+ 	return st.irq_last;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* One Linux-style FIFO message, at most TCM_MAX_XFER bytes either way. */
+ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > TCM_MAX_XFER || nr > TCM_MAX_XFER || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+@@ -227,7 +246,8 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+ 	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
++	unsigned limit = 20000u + 200u * (nt + nr);
++	for (unsigned i = 0; i < limit; ++i) {
+ 		uint32_t irq = touch_irq();
+ 		if (irq & SE_ERRORS) {
+ 			err = (irq & SE_NACK) ? ENXIO : EIO;
+@@ -246,14 +266,18 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 			}
+ 			break;
+ 		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
++		if (nt && st.sent < nt && (irq & SE_TX_WM_IRQ)) {
++			/* Linux geni_i2c_tx_fifo_wr: up to depth-1 words per watermark. */
++			for (unsigned w = 0; w + 1u < st.tx_depth && st.sent < nt; ++w) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && st.sent < nt; ++j) {
++					word |= (uint32_t)tx[st.sent++] << (8u * j);
++				}
++				touch_wr(st.se, SE_TX, word);
++			}
++			if (st.sent == nt) {
++				touch_wr(st.se, SE_TX_WM, 0);
+ 			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
+ 		}
+ 		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+ 		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+@@ -515,7 +539,7 @@ touch_se_init(void)
+ 	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+ 	touch_wr(st.se, 0x24, 0x7f);
+ 	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_CLK_SEL, st.clk_level > 0 ? (uint32_t)st.clk_level : 0u);
+ 	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+ 	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+@@ -525,6 +549,7 @@ touch_se_init(void)
+ 	touch_wr(st.se, 0x284, SE_PACK0);
+ 	touch_wr(st.se, 0x288, SE_PACK1);
+ 	touch_wr(st.se, SE_TX_WM, 0);
++	st.tx_depth = (tx >> 16) & 0x3fu;
+ 	touch_wr(st.se, 0x810, 0);
+ 	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+ 	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+@@ -545,6 +570,410 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++/* ---- aurora: Synaptics TCM (S3908), after oplus synaptics_tcm_oncell.c ---- */
++#define TCM_MARKER       0xa5u
++#define TCM_PAD          0x5au
++#define TCM_MIN_READ     9u
++#define TCM_RD_CHUNK     256u
++#define TCM_PAYLOAD_MAX  1024u
++#define TCM_CMD_CONTINUE 0x01u
++#define TCM_CMD_IDENTIFY 0x02u
++#define TCM_CMD_RUN_APP  0x14u
++#define TCM_CMD_APP_INFO 0x20u
++#define TCM_CMD_GET_CFG  0x25u
++#define TCM_CMD_SET_CFG  0x26u
++#define TCM_REP_IDENTIFY 0x10u
++#define TCM_REP_TOUCH    0x11u
++
++static struct {
++	uint8_t msg[TCM_PAYLOAD_MAX + 8];
++	uint8_t code;
++	unsigned len;           /* payload length; payload at msg + 4 */
++	unsigned max_write, max_x, max_y, max_objects;
++	uint8_t cfg[512];
++	unsigned cfg_len;
++	bool reset_seen;
++} tcm;
++
++static unsigned
++tcm_le16(const uint8_t *p)
++{
++	return p[0] | ((unsigned)p[1] << 8);
++}
++
++/* Read one message. code 0/2/3 (idle/busy/stray continue) => len 0. */
++static int
++tcm_read(void)
++{
++	uint8_t *m = tcm.msg;
++	int err = touch_msg(AUR_ADDR, NULL, 0, m, TCM_MIN_READ, false);
++	if (err) {
++		return err;
++	}
++	if (m[0] != TCM_MARKER) {
++		return EIO;
++	}
++	tcm.code = m[1];
++	tcm.len = tcm_le16(m + 2);
++	if (tcm.code == 0 || tcm.code == 2 || tcm.code == 3) {
++		tcm.len = 0;
++		return 0;
++	}
++	if (tcm.len > TCM_PAYLOAD_MAX) {
++		return EMSGSIZE;
++	}
++	unsigned total = 4u + tcm.len + 1u, off = TCM_MIN_READ;
++	while (off < total) {
++		unsigned xfer = total - off;
++		if (xfer > TCM_RD_CHUNK - 2u) {
++			xfer = TCM_RD_CHUNK - 2u;
++		}
++		if (xfer == 1) {
++			m[off++] = TCM_PAD;
++			break;
++		}
++		uint8_t chunk[TCM_RD_CHUNK];
++		err = touch_msg(AUR_ADDR, NULL, 0, chunk, xfer + 2u, false);
++		if (err) {
++			return err;
++		}
++		if (chunk[0] != TCM_MARKER || chunk[1] != 3u) {
++			return EIO;
++		}
++		memcpy(m + off, chunk + 2, xfer);
++		off += xfer;
++	}
++	if (m[total - 1] != TCM_PAD) {
++		return EIO;
++	}
++	if (tcm.code == TCM_REP_IDENTIFY) {
++		tcm.reset_seen = true;
++		if (tcm.len >= 24) {
++			tcm.max_write = tcm_le16(m + 4 + 22);
++		}
++	}
++	return 0;
++}
++
++/* Write a command (chunked with CONTINUE_WRITE) and poll for its response. */
++static int
++tcm_cmd(uint8_t cmd, const uint8_t *payload, unsigned plen, unsigned timeout_ms)
++{
++	uint8_t out[TCM_MAX_XFER];
++	unsigned chunk = tcm.max_write ? tcm.max_write : 64u;
++	if (chunk > sizeof(out)) {
++		chunk = sizeof(out);
++	}
++	unsigned remaining = plen + 2u, sent = 0;
++	bool first = true;
++	while (remaining || first) {
++		unsigned space = chunk - 1u, n = remaining < space ? remaining : space, o = 0;
++		out[o++] = first ? cmd : TCM_CMD_CONTINUE;
++		for (unsigned i = 0; i < n; ++i, ++sent) {
++			/* stream = len_lo, len_hi, payload... */
++			out[o++] = sent == 0 ? (uint8_t)plen : sent == 1 ? (uint8_t)(plen >> 8) :
++			    payload[sent - 2u];
++		}
++		int err = touch_msg(AUR_ADDR, out, o, NULL, 0, false);
++		if (err) {
++			printf("SWEET TOUCH: tcm cmd %#x write err=%d\n", cmd, err);
++			return err;
++		}
++		remaining -= n;
++		first = false;
++	}
++	for (unsigned t = 0; t < timeout_ms; t += 2) {
++		touch_wait(2);
++		int err = tcm_read();
++		if (err) {
++			continue;
++		}
++		if (tcm.code == 1u) {
++			if (cmd == TCM_CMD_IDENTIFY && tcm.len >= 24) {
++				tcm.max_write = tcm_le16(tcm.msg + 4 + 22);
++			}
++			return 0;
++		}
++		if (tcm.code == TCM_REP_IDENTIFY &&
++		    (cmd == TCM_CMD_RUN_APP || cmd == TCM_CMD_IDENTIFY)) {
++			return 0;
++		}
++		if (tcm.code >= 0x0cu && tcm.code <= 0x0fu) {
++			printf("SWEET TOUCH: tcm cmd %#x status=%#x err-byte=%#x\n", cmd, tcm.code,
++			    tcm.len ? tcm.msg[4] : 0);
++			return EIO;
++		}
++		/* idle/busy or an unrelated report: keep polling */
++	}
++	printf("SWEET TOUCH: tcm cmd %#x timeout\n", cmd);
++	return ETIMEDOUT;
++}
++
++static bool
++tcm_wait_identify(unsigned timeout_ms)
++{
++	for (unsigned t = 0; t < timeout_ms; t += 5) {
++		if (!tcm_read() && tcm.code == TCM_REP_IDENTIFY) {
++			return true;
++		}
++		touch_wait(5);
++	}
++	return false;
++}
++
++static unsigned
++tcm_bits(const uint8_t *r, unsigned rlen, unsigned offset, unsigned bits)
++{
++	if (bits == 0 || bits > 32 || offset + bits > rlen * 8u) {
++		return 0;
++	}
++	unsigned out = 0, done = 0;
++	while (done < bits) {
++		unsigned bo = offset % 8u, take = 8u - bo;
++		if (take > bits - done) {
++			take = bits - done;
++		}
++		unsigned v = (r[offset / 8u] >> bo) & (0xffu >> (8u - take));
++		out |= v << done;
++		done += take;
++		offset += take;
++	}
++	return out;
++}
++
++/* Interpret the report against the active config (syna_parse_report). */
++static int
++tcm_parse(void)
++{
++	const uint8_t *r = tcm.msg + 4;
++	unsigned rlen = tcm.len, idx = 0, next = 0, offset = 0, obj = 0;
++	unsigned objects = 0, active_objects = 0, steps = 0;
++	bool active_only = false, have_num = false;
++	unsigned status[TOUCH_MAX] = {0}, px[TOUCH_MAX] = {0}, py[TOUCH_MAX] = {0};
++	while (idx < tcm.cfg_len && ++steps < 4096) {
++		uint8_t code = tcm.cfg[idx++];
++		if (code == 0) {
++			break;
++		}
++		if (code == 1 || code == 2) {
++			obj = 0;
++			next = idx;
++			active_only = code == 1;
++			continue;
++		}
++		if (code == 3) {
++			if (active_only) {
++				if (have_num) {
++					if (++objects < active_objects) {
++						idx = next;
++					}
++				} else if (offset < rlen * 8u) {
++					idx = next;
++				}
++			} else if (++obj < tcm.max_objects) {
++				idx = next;
++			}
++			continue;
++		}
++		if (code == 4) {
++			offset = (offset + 7u) & ~7u;
++			continue;
++		}
++		if (idx >= tcm.cfg_len) {
++			return EIO;
++		}
++		unsigned bits = tcm.cfg[idx++];
++		unsigned v = tcm_bits(r, rlen, offset, bits);
++		switch (code) {
++		case 6:
++			obj = v;
++			break;
++		case 7:
++		case 8:
++		case 9:
++			if (obj >= TOUCH_MAX) {
++				return EIO;
++			}
++			(code == 7 ? status : code == 8 ? px : py)[obj] = v;
++			break;
++		case 0x18:
++			active_objects = v;
++			have_num = true;
++			break;
++		default:
++			break; /* timestamp, widths, gesture, grip, ...: skipped */
++		}
++		offset += bits;
++	}
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		if (status[i] != 1u && status[i] != 2u) {
++			continue;
++		}
++		unsigned sx = tcm.max_x ? px[i] * 1080u / (tcm.max_x + 1u) : px[i];
++		unsigned sy = tcm.max_y ? py[i] * 2400u / (tcm.max_y + 1u) : py[i];
++		x[i] = (int)(sx > 1079u ? 1079u : sx);
++		y[i] = (int)(sy > 2399u ? 2399u : sy);
++		mask |= 1u << i;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* identify -> (run app) -> app info -> report config. */
++static bool
++tcm_setup(void)
++{
++	tcm.reset_seen = false;
++	if (!tcm_wait_identify(500)) {
++		printf("SWEET TOUCH: no identify report after reset; sending IDENTIFY\n");
++		if (tcm_cmd(TCM_CMD_IDENTIFY, NULL, 0, 1000) || tcm.len < 2) {
++			return false;
++		}
++	}
++	const uint8_t *p = tcm.msg + 4;
++	printf("SWEET TOUCH: S3908 identify code=%#x len=%u ver=%u mode=%u part=%.16s build=%02x%02x%02x%02x max-write=%u\n",
++	    tcm.code, tcm.len, p[0], p[1], (const char *)(p + 2), p[18], p[19], p[20], p[21],
++	    tcm.max_write);
++	if (p[1] != 1u) {
++		printf("SWEET TOUCH: not in application mode; RUN_APPLICATION_FIRMWARE\n");
++		if (tcm_cmd(TCM_CMD_RUN_APP, NULL, 0, 3000) || tcm.code != TCM_REP_IDENTIFY ||
++		    tcm.msg[5] != 1u) {
++			printf("SWEET TOUCH: application firmware did not start (mode=%u)\n", tcm.msg[5]);
++			return false;
++		}
++	}
++	if (tcm_cmd(TCM_CMD_APP_INFO, NULL, 0, 1000) || tcm.len < 46) {
++		printf("SWEET TOUCH: GET_APPLICATION_INFO failed len=%u\n", tcm.len);
++		return false;
++	}
++	p = tcm.msg + 4;
++	unsigned app_status = tcm_le16(p + 2), cfg_max = tcm_le16(p + 12);
++	tcm.max_x = tcm_le16(p + 32);
++	tcm.max_y = tcm_le16(p + 34);
++	tcm.max_objects = tcm_le16(p + 36);
++	printf("SWEET TOUCH: app ver=%u status=%u cfg-max=%u max=%ux%u objects=%u\n",
++	    tcm_le16(p), app_status, cfg_max, tcm.max_x, tcm.max_y, tcm.max_objects);
++	if (app_status != 0) {
++		return false;
++	}
++	/* The oplus driver's normal-mode config. */
++	static const uint8_t normal[] = {0x10, 8, 1, 6, 4, 7, 4, 8, 16, 9, 16,
++	    11, 12, 12, 12, 203, 32, 3, 0};
++	if (cfg_max >= sizeof(normal) && cfg_max <= sizeof(tcm.cfg)) {
++		memset(tcm.cfg, 0, sizeof(tcm.cfg));
++		memcpy(tcm.cfg, normal, sizeof(normal));
++		if (!tcm_cmd(TCM_CMD_SET_CFG, tcm.cfg, cfg_max, 1000)) {
++			tcm.cfg_len = cfg_max;
++			printf("SWEET TOUCH: report config set (%u bytes)\n", cfg_max);
++			return true;
++		}
++	}
++	/* Fall back to whatever the firmware is already using. */
++	if (tcm_cmd(TCM_CMD_GET_CFG, NULL, 0, 1000) || !tcm.len || tcm.len > sizeof(tcm.cfg)) {
++		printf("SWEET TOUCH: no usable report config\n");
++		return false;
++	}
++	memcpy(tcm.cfg, tcm.msg + 4, tcm.len);
++	tcm.cfg_len = tcm.len;
++	printf("SWEET TOUCH: using firmware report config (%u bytes)\n", tcm.len);
++	return true;
++}
++
++static void
++aurora_touch(void)
++{
++	static const uint32_t branches[] = {0x23140, 0x23138, 0x18004, 0x18008, 0x185fc};
++	st.vote = AUR_GCC_VOTE;
++	st.vote_mask = (0x0fu << 18) | (1u << 27);
++	st.rcg = AUR_RCG;
++	st.branches = branches;
++	st.nbranches = sizeof(branches) / sizeof(branches[0]);
++	printf("SWEET TOUCH: aurora S3908: mapping GCC/TLMM-south/SE13\n");
++	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(AUR_SOUTH_PA, 0x28000);
++	st.se = ml_io_map(AUR_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("SWEET TOUCH: MMIO mapping failed\n");
++		return;
++	}
++	if (!touch_clocks() || !touch_se_init()) {
++		return;
++	}
++	printf("SWEET TOUCH: TLMM cfg36=%#x cfg37=%#x reset=%#x/%#x irq=%#x/%#x\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(36)), touch_rd(st.gpio, TOUCH_GPIO_CFG(37)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(38)), touch_rd(st.gpio, TOUCH_GPIO_IO(38)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(39)), touch_rd(st.gpio, TOUCH_GPIO_IO(39)));
++	touch_gpio(39, 0, 0, 0, false, false); /* IRQ input, 2 mA, no bias (DT) */
++	touch_gpio(38, 0, 0, 0, true, false);  /* hold in reset while rails settle */
++	int pe = sweet_rpmh_vreg_enable("ldoa13", 3008);
++	int pe2 = sweet_rpmh_vreg_enable("ldoc1", 1800);
++	printf("SWEET TOUCH: L13A 3008 mV err=%d, L1C 1800 mV err=%d\n", pe, pe2);
++	if (pe || pe2) {
++		printf("SWEET TOUCH: (continuing: rails may already be on from the bootloader)\n");
++	}
++	touch_gpio(36, 1, 0, 0, false, false); /* qup13 SDA/SCL, 2 mA, no bias */
++	touch_gpio(37, 1, 0, 0, false, false);
++	touch_wait(10);
++	touch_gpio(38, 0, 0, 0, true, true);
++	touch_wait(80); /* RESET_TO_NORMAL_TIME */
++	bool ok = false;
++	for (unsigned attempt = 0; attempt < 3 && !ok && !st.dead; ++attempt) {
++		ok = tcm_setup();
++		if (!ok) {
++			printf("SWEET TOUCH: setup attempt %u failed; resetting IC\n", attempt);
++			touch_gpio(38, 0, 0, 0, true, false);
++			touch_wait(10);
++			touch_gpio(38, 0, 0, 0, true, true);
++			touch_wait(80);
++		}
++	}
++	if (!ok) {
++		printf("SWEET TOUCH: S3908 setup failed (dead=%d); stopping\n", st.dead);
++		return;
++	}
++	printf("SWEET TOUCH: selected S3908 TCM, 1080x2400, irq gpio39 poll=5ms\n");
++	unsigned errors = 0, ticks = 0, reports = 0;
++	while (!st.dead) {
++		bool irq = !(touch_rd(st.gpio, TOUCH_GPIO_IO(39)) & 1u); /* level low */
++		if (irq || (++ticks % 20u) == 0) {
++			for (unsigned n = 0; n < 4; ++n) {
++				tcm.reset_seen = false;
++				int err = tcm_read();
++				if (!err && tcm.code == TCM_REP_TOUCH) {
++					err = tcm_parse();
++					if (!err && reports++ < 5) {
++						printf("SWEET TOUCH: report len=%u active=%#x\n", tcm.len, st.active);
++					}
++				} else if (!err && tcm.reset_seen) {
++					printf("SWEET TOUCH: IC reset detected; reconfiguring\n");
++					touch_report(0, st.x, st.y);
++					if (!tcm_setup()) {
++						err = EIO;
++					}
++				}
++				if (err) {
++					if ((errors++ % 100u) == 0) {
++						printf("SWEET TOUCH: read err=%d code=%#x irq=%#x\n", err, tcm.code,
++						    st.irq_status);
++					}
++					if (errors == 10) {
++						touch_report(0, st.x, st.y);
++					}
++					break;
++				}
++				errors = 0;
++				if (touch_rd(st.gpio, TOUCH_GPIO_IO(39)) & 1u) {
++					break;
++				}
++			}
++		}
++		touch_wait(5);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -558,6 +987,16 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
++	if (sweet_is_sm8250()) {
++		aurora_touch();
++		goto out;
++	}
++	static const uint32_t sweet_branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	st.vote = TOUCH_GCC_VOTE;
++	st.vote_mask = (0x0fu << 18) | (1u << 23);
++	st.rcg = TOUCH_RCG;
++	st.branches = sweet_branches;
++	st.nbranches = sizeof(sweet_branches) / sizeof(sweet_branches[0]);
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..3d10793 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,13 +41,14 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern bool sweet_is_sm8250(void);
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+-static const struct {
++static const struct usb_clk {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+@@ -60,6 +61,17 @@ static const struct {
+ 	{ "clkref", 0x8c010 },
+ };
+ 
++/* aurora (SM8250, Linux gcc-sm8250.c); same index meaning as usb_cbcr. */
++static const struct usb_clk usb_cbcr_sm8250[] = {
++	{ "master", 0x0f010 },
++	{ "sleep", 0x0f018 },
++	{ "mock-utmi", 0x0f01c },
++	{ "cfg-noc-axi", 0x0f07c },
++	{ "aggre-axi", 0x0f080 },
++	{ "phy-aux", 0x0f054 },
++	{ "phy-com-aux", 0x0f058 },
++};
++
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+@@ -79,6 +91,8 @@ sweet_usb_probe(void)
+ 	int enabled = 1;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
++	bool aurora = sweet_is_sm8250();
++	const struct usb_clk *clk = aurora ? usb_cbcr_sm8250 : usb_cbcr;
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+@@ -93,8 +107,8 @@ sweet_usb_probe(void)
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++		cbcr[i] = usb_rd(gcc, clk[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", clk[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+@@ -119,6 +133,10 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++	if (aurora) {
++		/* SM8250 has a SNPS 7nm HS PHY at 0x088e3000, not QUSB2. */
++		return;
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
