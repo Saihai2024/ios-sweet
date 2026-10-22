@@ -829,7 +829,7 @@ index 03defe6..b127608 100644
  	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
  	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..3d10793 100644
+index b6c1a41..cb6e5f3 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -41,13 +41,14 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -866,7 +866,7 @@ index b6c1a41..3d10793 100644
  #define DWC3_PA                 0x0a600000
  #define DWC3_SIZE               0x0000d000
  #define QUSB2_PA                0x088e2000
-@@ -79,6 +91,8 @@ sweet_usb_probe(void)
+@@ -79,12 +91,17 @@ sweet_usb_probe(void)
  	int enabled = 1;
  	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
  	bool clocks_on = true;
@@ -875,7 +875,16 @@ index b6c1a41..3d10793 100644
  
  	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
  	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
-@@ -93,8 +107,8 @@ sweet_usb_probe(void)
+ 	if (!enabled) {
+ 		return;
+ 	}
++	if (aurora) {
++		printf("SWEET USB: aurora stage 0: mapping GCC (sweetusb=%d)\n", enabled);
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+@@ -93,12 +110,21 @@ sweet_usb_probe(void)
  	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
  	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
  	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
@@ -886,7 +895,33 @@ index b6c1a41..3d10793 100644
  		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
  	}
  	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
-@@ -119,6 +133,10 @@ sweet_usb_probe(void)
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	if (aurora) {
++		/* An unclocked DWC3 access ends in a NoC error and a Qualcomm RAM dump, so
++		 * the console is the only record: stage each step and pause on screen. */
++		clocks_on = clocks_on && !(cbcr[4] & CBCR_CLK_OFF);
++		printf("SWEET USB: aurora stage 1 BCR 0x%08x master-rcg 0x%08x/0x%08x utmi-rcg 0x%08x clocks_on=%d\n",
++		    usb_rd(gcc, 0x0f000), usb_rd(gcc, 0x0f020), usb_rd(gcc, 0x0f024),
++		    usb_rd(gcc, 0x0f038), clocks_on);
++		delay(3000000);
++	}
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+@@ -108,6 +134,12 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+ 	}
++	if (aurora) {
++		printf("SWEET USB: aurora stage 2: reading DWC3 GSNPSID\n");
++		delay(2000000);
++		printf("SWEET USB: aurora stage 3: GSNPSID 0x%08x\n", usb_rd(dwc, 0xc120));
++		delay(2000000);
++	}
+ 	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+ 	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+@@ -119,6 +151,10 @@ sweet_usb_probe(void)
  	if (enabled >= 2) {
  		sweet_usb_gadget_start(dwc);
  	}
@@ -897,3 +932,15 @@ index b6c1a41..3d10793 100644
  	if (cbcr[5] & CBCR_CLK_OFF) {
  		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
  		return;
+@@ -866,6 +902,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
++	if (sweet_is_sm8250()) {
++		printf("SWEET USB: aurora stage 4: DCTL 0x%08x DSTS 0x%08x GCTL 0x%08x; soft reset next\n",
++		    dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GCTL));
++		delay(2000000);
++	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
