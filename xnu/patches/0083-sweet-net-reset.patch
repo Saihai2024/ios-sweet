@@ -1,11 +1,12 @@
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -494,6 +494,22 @@ ud_rx_done(void)
+@@ -494,6 +494,23 @@ ud_rx_done(void)
  {
  	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
  	ud_sync(UD_TRB_RX, 16);
  	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
  	ud_sync(UD_RX, UD_FRAME_MAX);
++	extern void PEHaltRestart(uint32_t);
 +	/* Remote reset: an Ethernet frame of local experimental type 0x88B5
 +	 * whose payload starts with "SWEETRST" reboots the phone, so the host
 +	 * can cycle iOS -> Android -> fastboot without holding the power
