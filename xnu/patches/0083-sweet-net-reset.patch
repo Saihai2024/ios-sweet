@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -494,10 +494,26 @@ ud_rx_done(void)
+@@ -494,6 +494,22 @@ ud_rx_done(void)
  {
  	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
  	ud_sync(UD_TRB_RX, 16);
