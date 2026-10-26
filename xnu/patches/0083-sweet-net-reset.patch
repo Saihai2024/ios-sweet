@@ -1,0 +1,26 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -494,10 +494,26 @@ ud_rx_done(void)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	/* Remote reset: an Ethernet frame of local experimental type 0x88B5
++	 * whose payload starts with "SWEETRST" reboots the phone, so the host
++	 * can cycle iOS -> Android -> fastboot without holding the power
++	 * button (there is no other management channel into this system).
++	 * Payload: "SWEETRST" + u32 sequence (ignored). */
++	static const uint8_t reset_magic[8] = {'S','W','E','E','T','R','S','T'};
++	if (len >= ETHER_HDR_LEN + sizeof(reset_magic)) {
++		const uint8_t *f = (const uint8_t *)(ud.dma + UD_RX);
++		uint16_t type = (uint16_t)((f[12] << 8) | f[13]);
++		if (type == 0x88B5 && memcmp(f + ETHER_HDR_LEN, reset_magic,
++		    sizeof(reset_magic)) == 0) {
++			printf("SWEET NET: reset frame, rebooting\n");
++			/* 1 == kPERestartCPU (pexpert/arm) */
++			PEHaltRestart(1);
++		}
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		mbuf_t m = NULL;
