@@ -1,0 +1,40 @@
+Start the SWEET process sampler from bsd_init() as well, not only from
+sweet_ufs attach: when the root is a ramdisk (rd=md0, e.g. qbig QEMU
+boots) there is no sweet_ufs LUN, so sweetsample= never produced any
+output. The start call is idempotent; whichever path runs first wins.
+
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -82,8 +82,13 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ void
+ sweet_sample_start(void)
+ {
+ 	thread_t thread;
++	static bool started;
++	if (started) {
++		return;  /* bsd_init and sweet_ufs attach may both call us */
++	}
++	started = true;
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1044,6 +1044,16 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
+
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Start the SWEET process sampler even when the root is a ramdisk
++	 * (rd=md0, no sweet_ufs LUN): see bsd/dev/sweet_sample.c.
++	 * The call is idempotent. */
++	{
++		extern void sweet_sample_start(void);
++		sweet_sample_start();
++	}
++#endif
++
+ 	pal_kernel_announce();
+
+ 	bsd_init_kprintf("calling mountroot_post_hook\n");
