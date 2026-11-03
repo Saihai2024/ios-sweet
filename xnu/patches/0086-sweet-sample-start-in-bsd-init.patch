@@ -25,15 +25,15 @@ output. The start call is idempotent; whichever path runs first wins.
  	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
  	bsd_utaskbootstrap();
 
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/* Start the SWEET process sampler even when the root is a ramdisk
 +	 * (rd=md0, no sweet_ufs LUN): see bsd/dev/sweet_sample.c.
-+	 * The call is idempotent. */
++	 * The call is idempotent.  Unconditional: an earlier
++	 * #if defined(ARM64_BOARD_CONFIG_SWEET) guard never held in this
++	 * translation unit and silently compiled the call out. */
 +	{
 +		extern void sweet_sample_start(void);
 +		sweet_sample_start();
 +	}
-+#endif
 +
  	pal_kernel_announce();
 
