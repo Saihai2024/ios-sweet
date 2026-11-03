@@ -1,7 +1,8 @@
 --- a/osfmk/mach/mach_param.h
 +++ b/osfmk/mach/mach_param.h
-@@ -72,7 +72,14 @@
-
+@@ -71,7 +71,15 @@
+ #define TASK_PORT_REGISTER_MAX  3
+ 
  /* Number of watchport for task */
 -#define TASK_MAX_WATCHPORT_COUNT 32
 +/*
@@ -13,6 +14,6 @@
 + * matching the modern xnu value.
 + */
 +#define TASK_MAX_WATCHPORT_COUNT 128
-
+ 
  /* Number of different task port flavor */
  #define TASK_SELF_PORT_COUNT 4
