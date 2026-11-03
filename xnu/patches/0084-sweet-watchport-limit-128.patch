@@ -1,0 +1,18 @@
+--- a/osfmk/mach/mach_param.h
++++ b/osfmk/mach/mach_param.h
+@@ -72,7 +72,14 @@
+
+ /* Number of watchport for task */
+-#define TASK_MAX_WATCHPORT_COUNT 32
++/*
++ * SWEET: iOS 27 launchd passes 41 IMP_WATCHPORTS actions when spawning
++ * user/501 services (SpringBoard et al.); xnu-8796 caps at 32 which fails
++ * posix_spawn with EINVAL and, when forced past the asserts, overflows the
++ * on-stack previous_elem_array[TASK_MAX_WATCHPORT_COUNT] in
++ * task_add_turnstile_watchports (stack-protector panic). Raise to 128,
++ * matching the modern xnu value.
++ */
++#define TASK_MAX_WATCHPORT_COUNT 128
+
+ /* Number of different task port flavor */
+ #define TASK_SELF_PORT_COUNT 4
