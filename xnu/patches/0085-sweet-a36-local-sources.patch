@@ -1,0 +1,1438 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -73,7 +73,7 @@
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+-		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
++		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
+ 	}
+ }
+@@ -85,4 +85,99 @@
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++}
++
++extern kern_return_t task_suspend_internal(task_t);
++extern kern_return_t task_resume_internal(task_t);
++
++struct sweet_ps_ctx {
++	char *buf;
++	size_t max;
++	size_t len;
++};
++
++static int
++sweet_ps_iter(proc_t p, void *arg)
++{
++	struct sweet_ps_ctx *c = (struct sweet_ps_ctx *)arg;
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (c->len + 64 < c->max) {
++		int n = snprintf(c->buf + c->len, c->max - c->len, "%5d st=%d %s\n",
++		    proc_pid(p), p->p_stat, name);
++		if (n > 0) {
++			c->len += (size_t)n;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++size_t
++sweet_debug_ps(char *buf, size_t max)
++{
++	struct sweet_ps_ctx c = { .buf = buf, .max = max, .len = 0 };
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, sweet_ps_iter, &c, NULL, NULL);
++	return c.len;
++}
++
++static int
++sweet_sample_one_iter(proc_t p, void *arg)
++{
++	const char *want = (const char *)arg;
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, want) == 0) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			sweet_sample_task(name, proc_pid(p), task);
++		}
++	}
++	return PROC_RETURNED;
++}
++
++void
++sweet_debug_sample_one(const char *name)
++{
++	printf("SMP --- on-demand sample %s\n", name);
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, sweet_sample_one_iter, (void *)(uintptr_t)name, NULL, NULL);
++}
++
++struct sweet_freeze_ctx {
++	const char *name;
++	bool freeze;
++	int count;
++};
++
++static int
++sweet_freeze_iter(proc_t p, void *arg)
++{
++	struct sweet_freeze_ctx *c = (struct sweet_freeze_ctx *)arg;
++	char name[32];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, c->name) == 0) {
++		task_t task = proc_task(p);
++		if (task != TASK_NULL) {
++			if (c->freeze) {
++				proc_lock(p);
++				p->p_stat = SSTOP;
++				proc_unlock(p);
++				(void)task_suspend_internal(task);
++			} else {
++				(void)task_resume_internal(task);
++				proc_lock(p);
++				p->p_stat = SRUN;
++				proc_unlock(p);
++			}
++			c->count++;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++int
++sweet_debug_freeze_name(const char *name, bool freeze)
++{
++	struct sweet_freeze_ctx c = { .name = name, .freeze = freeze, .count = 0 };
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, sweet_freeze_iter, &c, NULL, NULL);
++	return c.count;
+ }
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -601,7 +601,7 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
++	uint32_t cache = 1, wait = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+@@ -736,53 +736,65 @@
+ 	uint64_t total, seq;
+ };
+ 
++static uint64_t sweet_log_flushed;
++static uint64_t sweet_log_seq;
++
++void sweet_log_flush(void);
++
++void
++sweet_log_flush(void)
++{
++	if (!su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS || su.dma == 0) {
++		return;
++	}
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total == sweet_log_flushed) {
++		return;
++	}
++	uint64_t pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	int error = 0;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++sweet_log_seq,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (!error) {
++		sweet_log_flushed = total;
++	}
++}
++
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+-		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
+-
+-		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
+-		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
+-		}
+-		flushed = total;
++		sweet_log_flush();
+ 	}
+ }
+ 
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -34,20 +35,60 @@
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
+ #include <net/if_media.h>
++#include <net/route.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern bool sweet_is_sm8250(void);
++extern int PEHaltRestart(unsigned int type);
++extern int (*PE_halt_restart)(unsigned int type);
++extern void sweet_log_flush(void);
+ 
++#define MPM2_PSHOLD_PA          0x0c264000
++static vm_offset_t sweet_pshold_va;
++
++static int
++sweet_pe_halt_restart(unsigned int type __unused)
++{
++	printf("SWEET RESET: flushing log and triggering PSCI SYSTEM_RESET / PSHOLD\n");
++	sweet_log_flush();
++	/* ARM PSCI 0.2+ SYSTEM_RESET (0x84000009) via SMC */
++	__asm__ volatile (
++		"dsb sy\n\t"
++		"movz x0, #0x0009\n\t"
++		"movk x0, #0x8400, lsl #16\n\t"
++		"smc #0\n\t"
++		:
++		:
++		: "x0", "x1", "x2", "x3", "memory"
++	);
++	/* Fallback: pull Qualcomm MPM2_PSHOLD (0x0c264000 on SM8250) low */
++	if (sweet_pshold_va == 0) {
++		sweet_pshold_va = ml_io_map(MPM2_PSHOLD_PA, 0x1000);
++	}
++	if (sweet_pshold_va != 0) {
++		*(volatile uint32_t *)sweet_pshold_va = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	for (;;) {
++		__asm__ volatile ("wfi");
++	}
++	return 0;
++}
++
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+ #define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+-static const struct {
++static const struct usb_clk {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+@@ -60,6 +101,17 @@
+ 	{ "clkref", 0x8c010 },
+ };
+ 
++/* aurora (SM8250, Linux gcc-sm8250.c); same index meaning as usb_cbcr. */
++static const struct usb_clk usb_cbcr_sm8250[] = {
++	{ "master", 0x0f010 },
++	{ "sleep", 0x0f018 },
++	{ "mock-utmi", 0x0f01c },
++	{ "cfg-noc-axi", 0x0f07c },
++	{ "aggre-axi", 0x0f080 },
++	{ "phy-aux", 0x0f054 },
++	{ "phy-com-aux", 0x0f058 },
++};
++
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+@@ -79,12 +131,22 @@
+ 	int enabled = 1;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
++	bool aurora = sweet_is_sm8250();
++	const struct usb_clk *clk = aurora ? usb_cbcr_sm8250 : usb_cbcr;
+ 
++	if (sweet_pshold_va == 0) {
++		sweet_pshold_va = ml_io_map(MPM2_PSHOLD_PA, 0x1000);
++	}
++	PE_halt_restart = sweet_pe_halt_restart;
++
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+ 	}
++	if (aurora) {
++		printf("SWEET USB: aurora stage 0: mapping GCC (sweetusb=%d)\n", enabled);
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+@@ -93,12 +155,18 @@
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++		cbcr[i] = usb_rd(gcc, clk[i].off);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", clk[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	if (aurora) {
++		clocks_on = clocks_on && !(cbcr[4] & CBCR_CLK_OFF);
++		printf("SWEET USB: aurora stage 1 BCR 0x%08x master-rcg 0x%08x/0x%08x utmi-rcg 0x%08x clocks_on=%d\n",
++		    usb_rd(gcc, 0x0f000), usb_rd(gcc, 0x0f020), usb_rd(gcc, 0x0f024),
++		    usb_rd(gcc, 0x0f038), clocks_on);
++	}
+ 	if (!clocks_on) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+@@ -108,6 +176,10 @@
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+ 	}
++	if (aurora) {
++		printf("SWEET USB: aurora stage 2: reading DWC3 GSNPSID\n");
++		printf("SWEET USB: aurora stage 3: GSNPSID 0x%08x\n", usb_rd(dwc, 0xc120));
++	}
+ 	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+ 	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+@@ -119,6 +191,10 @@
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++	if (aurora) {
++		/* SM8250 has a SNPS 7nm HS PHY at 0x088e3000, not QUSB2. */
++		return;
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -181,7 +257,12 @@
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
++#define DEPCMD_CLEARSTALL       5
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_FORCERM          (1u << 11)
++#define GTXFIFOSIZ(n)           (0xc300 + 4 * (n))
++#define GRXFIFOSIZ0             0xc380
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+@@ -222,6 +303,7 @@
+ 	vm_offset_t dwc;
+ 	vm_offset_t dma;
+ 	uint64_t    dma_pa;
++	bool        dma_nc;         /* ABL-owned non-cacheable window: no cache maintenance */
+ 	uint32_t    evt_pos;
+ 	int         sleep_chan;
+ 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
+@@ -229,6 +311,9 @@
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
++	bool        active[8];      /* a transfer is started on this physical endpoint */
++	uint8_t     xri[8];         /* its transfer resource index (for EndTransfer) */
++	uint32_t    data_events;
+ 	/* network */
+ 	ifnet_t     ifp;
+ 	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
+@@ -254,6 +339,10 @@
+ static void
+ ud_sync(uint32_t off, uint32_t len)
+ {
++	if (ud.dma_nc) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -281,6 +370,10 @@
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+ 				return -1;
+ 			}
++			if ((cmd & 0xf) == DEPCMD_STARTTRANSFER && ep < 8) {
++				ud.active[ep] = true;
++				ud.xri[ep] = (uint8_t)((v >> 16) & 0x7f);
++			}
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -328,7 +421,62 @@
+ 	ud_start_setup();
+ }
+ 
++/* EndTransfer (ForceRM) on a physical endpoint that has a transfer started. */
++static void
++ud_end_transfer(unsigned ep)
++{
++	if (ep >= 8 || !ud.active[ep]) {
++		return;
++	}
++	(void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xri[ep] << 16), 0, 0, 0);
++	ud.active[ep] = false;
++	delay(100);
++}
++
++static void ud_link_event(bool up);
++
+ /*
++ * Bus reset / disconnect / SET_CONFIGURATION(0 or again): stop the data
++ * endpoints and forget the configuration, so the next SET_CONFIGURATION
++ * sets them up from scratch (Linux dwc3_gadget_reset_interrupt + the
++ * function's ep disable).
++ */
++static void
++ud_stop_data(const char *why)
++{
++	bool was = ud.configured;
++	ud_end_transfer(EP_RX);
++	ud_end_transfer(EP_TX);
++	ud_end_transfer(EP_INT);
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	if (ud.lock != NULL) {
++		lck_mtx_lock(ud.lock);
++	}
++	ud.configured = false;
++	ud.data_alt = 0;
++	ud.tx_busy = false;
++	if (ud.lock != NULL) {
++		lck_mtx_unlock(ud.lock);
++	}
++	if (was) {
++		ud_link_event(false);
++	}
++	printf("SWEET USB: data endpoints stopped (%s), DALEPENA 0x%08x\n", why, dwc_rd(DALEPENA));
++}
++
++/* ep0 in the middle of a control transfer at reset: end it, stall, re-arm SETUP. */
++static void
++ud_ep0_reset(void)
++{
++	if (ud.state == EP0_SETUP && ud.active[0]) {
++		return;
++	}
++	ud_end_transfer(0);
++	ud_end_transfer(1);
++	ud_stall();
++}
++
++/*
+  * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether)
+  * and macOS drive without extra drivers. VID 0x1209 / PID 0x0001 =
+  * pid.codes test ID, not a product.
+@@ -378,7 +526,6 @@
+ 
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+-static void ud_link_event(bool up);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -389,6 +536,7 @@
+ 	n[2] = 1; n[3] = 0;             /* connected */
+ 	n[4] = 0; n[5] = 0;             /* interface 0 */
+ 	n[6] = 0; n[7] = 0;
++	ud_end_transfer(EP_INT);        /* a previous one the host never read */
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
+@@ -397,8 +545,11 @@
+ ud_configure(void)
+ {
+ 	if (ud.configured) {
+-		return;
++		ud_stop_data("set_config again");
+ 	}
++	printf("SWEET USB: FIFOs TX0 0x%08x TX1 0x%08x TX2 0x%08x TX3 0x%08x TX4 0x%08x RX0 0x%08x DCFG 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(GTXFIFOSIZ(0)), dwc_rd(GTXFIFOSIZ(1)), dwc_rd(GTXFIFOSIZ(2)), dwc_rd(GTXFIFOSIZ(3)),
++	    dwc_rd(GTXFIFOSIZ(4)), dwc_rd(GRXFIFOSIZ0), dwc_rd(DCFG), dwc_rd(DSTS));
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+@@ -412,8 +563,7 @@
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+-	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: ECM endpoints configured, DALEPENA 0x%08x\n", dwc_rd(DALEPENA));
+ }
+ 
+ static void
+@@ -428,10 +578,12 @@
+ 	uint32_t n = 0;
+ 	bool ok = true;
+ 
+-	printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	if (!(type == 0x21 && req == 0x43)) {
++		printf("SWEET USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	}
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++		ok = !(type & 0x80);    /* OUT (with or without data): accept; IN (statistics): stall */
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+@@ -448,6 +600,8 @@
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
+ 		if (value == 1) {
+ 			ud_configure();
++		} else {
++			ud_stop_data("set_config 0");
+ 		}
+ 		printf("SWEET USB: configured (%u)\n", value);
+ 	} else if (req == 8) {          /* GET_CONFIGURATION */
+@@ -455,16 +609,45 @@
+ 	} else if (req == 0) {          /* GET_STATUS */
+ 		data[0] = 0; data[1] = 0; n = 2;
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+-		if (index == 1) {
++		if (index == 1 && ud.configured) {
++			/*
++			 * Alternate setting change resets the bulk endpoints (the host
++			 * restarts its data toggles at DATA0; ClearStall does the same
++			 * on the DWC3 side).
++			 */
++			ud_end_transfer(EP_RX);
++			ud_end_transfer(EP_TX);
++			lck_mtx_lock(ud.lock);
++			ud.tx_busy = false;
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
++			lck_mtx_unlock(ud.lock);
++			(void)ud_epcmd(EP_RX, DEPCMD_CLEARSTALL, 0, 0, 0);
++			(void)ud_epcmd(EP_TX, DEPCMD_CLEARSTALL, 0, 0, 0);
++			if (value == 1) {
++				ud_rx_arm();
+ 				ud_notify_connected();
+ 				ud_link_event(true);
++				lck_mtx_lock(ud.lock);
++				ud_tx_kick_locked();
++				lck_mtx_unlock(ud.lock);
+ 			}
++			printf("SWEET USB: data alt %u\n", value);
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+ 	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++		if ((type & 0x1f) == 2 && value == 0 && (index & 0x0f) != 0) {      /* ENDPOINT_HALT */
++			unsigned pep = (unsigned)(index & 0x0f) * 2 + ((index & 0x80) ? 1 : 0);
++			if (pep == EP_RX || pep == EP_TX || pep == EP_INT) {
++				if (req == 1) {
++					/* ClearStall also resets the data sequence number */
++					(void)ud_epcmd(pep, DEPCMD_CLEARSTALL, 0, 0, 0);
++				} else {
++					(void)ud_epcmd(pep, DEPCMD_SETSTALL, 0, 0, 0);
++				}
++				printf("SWEET USB: %s halt ep%u\n", req == 1 ? "clear" : "set", pep);
++			}
++		}
+ 	} else {
+ 		ok = false;
+ 	}
+@@ -483,7 +666,9 @@
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		/* OUT data (e.g. multicast filters) is read and dropped; length a multiple of 64 */
++		uint32_t olen = ((uint32_t)length + 63) & ~63u;
++		ud_start(0, UD_DATA, olen > 512 ? 512 : olen, TRBCTL_DATA);
+ 	}
+ }
+ 
+@@ -502,7 +687,6 @@
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+-	extern void PEHaltRestart(uint32_t);
+ 	/* Remote reset: an Ethernet frame of local experimental type 0x88B5
+ 	 * whose payload starts with "SWEETRST" reboots the phone, so the host
+ 	 * can cycle iOS -> Android -> fastboot without holding the power
+@@ -515,8 +699,7 @@
+ 		if (type == 0x88B5 && memcmp(f + ETHER_HDR_LEN, reset_magic,
+ 		    sizeof(reset_magic)) == 0) {
+ 			printf("SWEET NET: reset frame, rebooting\n");
+-			/* 1 == kPERestartCPU (pexpert/arm) */
+-			PEHaltRestart(1);
++			sweet_pe_halt_restart(1);
+ 		}
+ 	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+@@ -553,7 +736,7 @@
+ static void
+ ud_tx_kick_locked(void)
+ {
+-	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured && ud.data_alt == 1) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+ 		ud.txq_count--;
+@@ -718,6 +901,19 @@
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	{
++		struct sockaddr_in dst, gw;
++		struct rtentry *nrt = NULL;
++		bzero(&dst, sizeof(dst)); dst.sin_len = sizeof(dst); dst.sin_family = AF_INET;
++		bzero(&gw, sizeof(gw)); gw.sin_len = sizeof(gw); gw.sin_family = AF_INET;
++		gw.sin_addr.s_addr = htonl(0xc0a80701);        /* 192.168.7.1 */
++		errno_t rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gw,
++		    NULL, RTF_UP | RTF_GATEWAY | RTF_STATIC, &nrt);
++		if (nrt != NULL) {
++			rtfree(nrt);
++		}
++		printf("SWEET NET: default route via 192.168.7.1 -> %d\n", rerr);
++	}
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
+@@ -727,8 +923,10 @@
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
++			printf("SWEET USB: bus reset (state %d cfg %d)\n", ud.state, ud.configured);
++			ud_stop_data("bus reset");
++			ud_ep0_reset();
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -739,6 +937,7 @@
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			ud_stop_data("disconnect");
+ 		}
+ 		return;
+ 	}
+@@ -746,6 +945,15 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep < 8) {
++		ud.active[ep] = false;  /* one TRB per transfer: XferComplete ends it */
++	}
++	if (ep > 1 && ud.data_events++ < 100) {
++		printf("SWEET USB: ep%u event type %u status 0x%x\n", ep, type, status);
++	}
++	if (ep == EP_INT && type == 1) {
++		return;
++	}
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;
+@@ -803,7 +1011,7 @@
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				if (ud.events++ < 200) {
++				if (ud.events++ < 400) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
+ 				ud_event(ev);
+@@ -811,7 +1019,9 @@
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
+ 		if ((++ticks % 30000) == 0) {
+-			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++			printf("SWEET USB: ue0 rx %llu tx %llu frames cfg %d alt %u txbusy %d q %u DALEPENA 0x%08x DSTS 0x%08x\n",
++			    ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.tx_busy, ud.txq_count,
++			    dwc_rd(DALEPENA), dwc_rd(DSTS));
+ 		}
+ 		ud_sleep_ms(1);
+ 	}
+@@ -826,15 +1036,218 @@
+  */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
++extern int sweet_console_muted;         /* osfmk/console/serial_console.c */
++extern size_t sweet_debug_ps(char *buf, size_t max);
++extern void sweet_debug_sample_one(const char *name);
++extern int sweet_debug_freeze_name(const char *name, bool freeze);
++extern void sweet_fb_set_hz(uint32_t hz);
+ 
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++extern size_t sweet_fb_summary(char *buf, size_t max);
++
++static size_t
++sweet_vfs_read(const char *path, char *rep, size_t max)
++{
++	vnode_t vp = NULL;
++	vfs_context_t ctx = vfs_context_kernel();
++	static char rbuf[1024];
++	errno_t err = vnode_lookup(path, 0, &vp, ctx);
++	if (err) {
++		return (size_t)snprintf(rep, max, "ERR lookup %d\n", err);
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	(void)uio_addiov(uio, CAST_USER_ADDR_T(rbuf), sizeof(rbuf) - 1);
++	err = VNOP_READ(vp, uio, 0, ctx);
++	user_ssize_t n = (err == 0) ? (user_ssize_t)(sizeof(rbuf) - 1 - uio_resid(uio)) : -1;
++	uio_free(uio);
++	vnode_put(vp);
++	if (err) {
++		return (size_t)snprintf(rep, max, "ERR read %d\n", err);
++	}
++	size_t o = (size_t)snprintf(rep, max, "OK %zd bytes\n", n);
++	for (ssize_t i = 0; i < n && o + 8 < max; i++) {
++		uint8_t c = (uint8_t)rbuf[i];
++		if (c >= 0x20 && c < 0x7f && c != '\\') {
++			rep[o++] = (char)c;
++		} else {
++			o += (size_t)snprintf(rep + o, max - o, "\\x%02x", c);
++		}
++	}
++	if (o < max) {
++		rep[o++] = '\n';
++	}
++	return o;
++}
++
++static size_t
++sweet_vfs_write_cmd(const char *args, char *rep, size_t max)
++{
++	char path[256];
++	const char *sp = strchr(args, ' ');
++	size_t pl = sp ? (size_t)(sp - args) : strlen(args);
++	if (sp == NULL || pl == 0 || pl >= sizeof(path)) {
++		return (size_t)snprintf(rep, max, "ERR vfsw <path> <text>\n");
++	}
++	memcpy(path, args, pl);
++	path[pl] = 0;
++	const char *text = sp + 1;
++	size_t tlen = strlen(text);
++	vnode_t vp = NULL;
++	vfs_context_t ctx = vfs_context_kernel();
++	errno_t err = vnode_lookup(path, 0, &vp, ctx);
++	if (err) {
++		return (size_t)snprintf(rep, max, "ERR lookup %d\n", err);
++	}
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++	(void)uio_addiov(uio, CAST_USER_ADDR_T(text), tlen);
++	err = VNOP_WRITE(vp, uio, 0, ctx);
++	uio_free(uio);
++	vnode_put(vp);
++	return (size_t)snprintf(rep, max, "%s write %zu -> %d\n", err ? "ERR" : "OK", tlen, err);
++}
++
+ static void
++ud_handle_cmd(socket_t cso)
++{
++	static char cmd[256];
++	static char rep[1400];
++	struct sockaddr_in from;
++	bzero(&from, sizeof(from));
++	from.sin_len = sizeof(from);
++	struct iovec iov = { .iov_base = cmd, .iov_len = sizeof(cmd) - 1 };
++	struct msghdr msg = {
++		.msg_name = &from, .msg_namelen = sizeof(from),
++		.msg_iov = &iov, .msg_iovlen = 1,
++	};
++	size_t recvd = 0;
++	while (sock_receive(cso, &msg, MSG_DONTWAIT, &recvd) == 0 && recvd > 0) {
++		cmd[recvd] = 0;
++		while (recvd > 0 && (cmd[recvd - 1] == '\n' || cmd[recvd - 1] == '\r' || cmd[recvd - 1] == ' ')) {
++			cmd[--recvd] = 0;
++		}
++		size_t rlen = 0;
++		if (strcmp(cmd, "ping") == 0 || strcmp(cmd, "status") == 0) {
++			rlen = (size_t)snprintf(rep, sizeof(rep),
++			    "PONG aurora iOS 16.7.16 | ue0 rx=%llu tx=%llu | log_pos=%llu\n",
++			    ud.rx_frames, ud.tx_frames, sweet_log_position());
++		} else if (strcmp(cmd, "ps") == 0) {
++			rlen = sweet_debug_ps(rep, sizeof(rep));
++		} else if (strncmp(cmd, "sample ", 7) == 0) {
++			sweet_debug_sample_one(cmd + 7);
++			rlen = (size_t)snprintf(rep, sizeof(rep), "OK sampled %s (check UDP 5140 log)\n", cmd + 7);
++		} else if (strncmp(cmd, "freeze ", 7) == 0) {
++			int cnt = sweet_debug_freeze_name(cmd + 7, true);
++			rlen = (size_t)snprintf(rep, sizeof(rep), "OK froze %s (%d procs)\n", cmd + 7, cnt);
++		} else if (strncmp(cmd, "thaw ", 5) == 0) {
++			int cnt = sweet_debug_freeze_name(cmd + 5, false);
++			rlen = (size_t)snprintf(rep, sizeof(rep), "OK thawed %s (%d procs)\n", cmd + 5, cnt);
++		} else if (strncmp(cmd, "hz ", 3) == 0) {
++			uint32_t hz = (uint32_t)strtoul(cmd + 3, NULL, 10);
++			sweet_fb_set_hz(hz);
++			rlen = (size_t)snprintf(rep, sizeof(rep), "OK set hz=%u\n", hz);
++		} else if (strcmp(cmd, "reboot") == 0) {
++			rlen = (size_t)snprintf(rep, sizeof(rep), "OK rebooting\n");
++			struct iovec riov = { .iov_base = rep, .iov_len = rlen };
++			struct msghdr rmsg = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &riov, .msg_iovlen = 1 };
++			size_t sent = 0;
++			(void)sock_send(cso, &rmsg, 0, &sent);
++			sweet_pe_halt_restart(1);
++		} else if (strncmp(cmd, "tap ", 4) == 0) {
++			int x = 0, y = 0;
++			if (sscanf(cmd + 4, "%d %d", &x, &y) == 2) {
++				sweet_hid_touch(0, 1, x, y);
++				ud_sleep_ms(80);
++				sweet_hid_touch(0, 0, x, y);
++				rlen = (size_t)snprintf(rep, sizeof(rep), "OK tap %d,%d\n", x, y);
++			} else {
++				rlen = (size_t)snprintf(rep, sizeof(rep), "ERR tap <x> <y>\n");
++			}
++		} else if (strncmp(cmd, "swipe ", 6) == 0) {
++			int x1 = 0, y1 = 0, x2 = 0, y2 = 0, ms = 300;
++			if (sscanf(cmd + 6, "%d %d %d %d %d", &x1, &y1, &x2, &y2, &ms) >= 4) {
++				sweet_hid_touch(0, 1, x1, y1);
++				int steps = ms / 40;
++				if (steps < 2) { steps = 2; }
++				if (steps > 50) { steps = 50; }
++				for (int i = 1; i < steps; i++) {
++					sweet_hid_touch(0, 1, x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
++					ud_sleep_ms(40);
++				}
++				ud_sleep_ms(40);
++				sweet_hid_touch(0, 0, x2, y2);
++				rlen = (size_t)snprintf(rep, sizeof(rep), "OK swipe %d,%d->%d,%d %dms\n", x1, y1, x2, y2, ms);
++			} else {
++				rlen = (size_t)snprintf(rep, sizeof(rep), "ERR swipe x1 y1 x2 y2 [ms]\n");
++			}
++		} else if (strncmp(cmd, "key ", 4) == 0) {
++			int k = 0, d = 1;
++			if (sscanf(cmd + 4, "%d %d", &k, &d) >= 1) {
++					sweet_hid_key(k, d != 0);
++				rlen = (size_t)snprintf(rep, sizeof(rep), "OK key %d %d\n", k, d);
++			} else {
++				rlen = (size_t)snprintf(rep, sizeof(rep), "ERR key <0-3> [down]\n");
++			}
++		} else if (strcmp(cmd, "fb") == 0) {
++			rlen = (int)sweet_fb_summary(rep, sizeof(rep) - 1);
++		} else if (strncmp(cmd, "vfsr ", 5) == 0) {
++			rlen = (int)sweet_vfs_read(cmd + 5, rep, sizeof(rep) - 1);
++		} else if (strncmp(cmd, "vfsw ", 5) == 0) {
++			rlen = (int)sweet_vfs_write_cmd(cmd + 5, rep, sizeof(rep) - 1);
++		} else {
++			rlen = (size_t)snprintf(rep, sizeof(rep),
++			    "ERR unknown cmd '%s' (valid: ping, ps, sample, freeze, thaw, hz, reboot, tap, swipe, key, fb, vfsr, vfsw)\n", cmd);
++		}
++		if (rlen > 0) {
++			struct iovec riov = { .iov_base = rep, .iov_len = rlen };
++			struct msghdr rmsg = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &riov, .msg_iovlen = 1 };
++			size_t sent = 0;
++			(void)sock_send(cso, &rmsg, 0, &sent);
++		}
++		recvd = 0;
++		iov.iov_base = cmd;
++		iov.iov_len = sizeof(cmd) - 1;
++	}
++}
++
++/*
++ * Once the log reaches the PC over USB, stop drawing kernel text on the
++ * panel (it still goes to the log ring; a panic draws again) and blank the
++ * old text, so the screen only shows the GUI. Without USB the text stays as
++ * the fallback. Boot-arg sweetquiet=0 keeps the text.
++ */
++static void
++ud_quiet_screen(void)
++{
++	static char blank[97];
++
++	if (sweet_console_muted) {
++		return;
++	}
++	/*
++	 * Scroll the framebuffer console off with newlines: fbcon clears each
++	 * new row through its own mapping. a26 mapped the 10 MB framebuffer
++	 * (I/O map exhausted -> panic), a27 unmapped an ml_io_map window
++	 * (permanent entry -> vm_map_delete panic); this maps nothing.
++	 */
++	memset(blank, '\n', sizeof(blank) - 1);
++	blank[sizeof(blank) - 1] = 0;
++	printf("%s", blank);
++	sweet_console_muted = 1;
++}
++
++static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	static char chunk[1400];
+ 	socket_t so = NULL;
++	socket_t cso = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
++	int quiet = 1;
+ 
++	PE_parse_boot_argn("sweetquiet", &quiet, sizeof(quiet));
++
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+@@ -843,13 +1256,28 @@
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured) {
++		if (!ud.configured || ud.data_alt != 1) {
+ 			continue;
+ 		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
++		if (cso == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &cso) == 0) {
++			struct sockaddr_in bind_in;
++			bzero(&bind_in, sizeof(bind_in));
++			bind_in.sin_len = sizeof(bind_in);
++			bind_in.sin_family = AF_INET;
++			bind_in.sin_port = htons(5141);
++			bind_in.sin_addr.s_addr = INADDR_ANY;
++			if (sock_bind(cso, (struct sockaddr *)&bind_in) != 0) {
++				sock_close(cso);
++				cso = NULL;
++			}
++		}
++		if (cso != NULL) {
++			ud_handle_cmd(cso);
++		}
+ 		uint32_t n;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+@@ -861,28 +1289,136 @@
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
++			if (quiet && sent > 0 && ud.rx_frames > 0 && !sweet_console_muted) {
++				ud_quiet_screen();
++			}
+ 		}
+ 	}
+ }
+ 
++/*
++ * aurora: DWC3 DMA goes through apps_smmu (0x15000000, SMMUv2, DT iommus SID 0
++ * mask 0). ABL left the USB stream on a translating context (its GEVNTADR is
++ * an IOVA in 0x90000000+), so the kernel's physical addresses fault. Dump the
++ * stream mapping and, unless sweetusbsmmu=0, switch the matching S2CRs to
++ * bypass so DMA addresses are physical.
++ */
++#define SMMU_PA         0x15000000
++#define SMMU_SIZE       0x100000
++#define USB_SID         0x0
++
++extern void sweet_log_flush(void);
++static vm_offset_t ud_smmu;
++
+ static void
++sweet_usb_smmu(void)
++{
++	int fix = 1;
++	uint32_t usb_cb = 3;
++	(void)PE_parse_boot_argn("sweetusbsmmu", &fix, sizeof(fix));
++	(void)PE_parse_boot_argn("sweetusbcb", &usb_cb, sizeof(usb_cb));
++	printf("SWEET USB: aurora stage 6a: reading apps_smmu (fix=%d cb=%u)\n", fix, usb_cb);
++	vm_offset_t s = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (s == 0) {
++		return;
++	}
++	ud_smmu = s;
++	uint32_t cr0 = usb_rd(s, 0x0), idr0 = usb_rd(s, 0x20), idr1 = usb_rd(s, 0x24);
++	uint32_t nsmr = idr0 & 0xff, ncb = idr1 & 0xff;
++	uint32_t pgsz = (idr1 & (1u << 31)) ? 0x10000 : 0x1000;
++	uint32_t npage = 1u << (((idr1 >> 28) & 7) + 1);
++	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x nsmr %u ncb %u pg 0x%x npage %u\n",
++	    cr0, idr0, idr1, nsmr, ncb, pgsz, npage);
++	/*
++	 * Only GR0 (SMR/S2CR) is touched: on SM8250 the hypervisor owns GR1 and
++	 * the context banks, and a read there aborts.
++	 * Furthermore, SM8250 hypervisor intercepts S2CR writes with TYPE=1 (BYPASS)
++	 * and rewrites them to TYPE=2 (FAULT = 0x00020000)!
++	 * Instead, bind USB (SID 0x0) to TYPE=0 (Translation Context Bank) sharing
++	 * cb 3 (used by UFS SMR[3] 0x800000e0 -> S2CR 0x00000003, which has 1:1 PA passthrough).
++	 */
++	int hits = 0, valid = 0;
++	uint32_t freei = nsmr;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = usb_rd(s, 0x800 + 4 * i);
++		uint32_t s2cr = usb_rd(s, 0xc00 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (i < 8) {
++				printf("SWEET USB: free SMR[%u] 0x%08x S2CR 0x%08x\n", i, smr, s2cr);
++			}
++			if (freei == nsmr) {
++				freei = i;
++			}
++			continue;
++		}
++		valid++;
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		bool match = ((id ^ USB_SID) & ~mask & 0x7fff) == 0;
++		printf("SWEET USB: SMR[%u] 0x%08x S2CR 0x%08x type %u cb %u%s\n", i, smr, s2cr,
++		    (s2cr >> 16) & 3, s2cr & 0xff, match ? " <- USB" : "");
++		if (match) {
++			hits++;
++		}
++	}
++	printf("SWEET USB: SMMU %d stream(s) match SID 0x%x (%d valid SMRs, free %u); sGFSR 0x%08x\n",
++	    hits, USB_SID, valid, freei, usb_rd(s, 0x48));
++	if (hits || !fix || freei >= nsmr) {
++		sweet_log_flush();
++		return;
++	}
++	/* S2CR first: TYPE=0 (Translation CB), CBNDX=usb_cb (default 3, same 1:1 CB as UFS). */
++	*(volatile uint32_t *)(s + 0xc00 + 4 * freei) = usb_cb & 0xff;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(s + 0x800 + 4 * freei) = (1u << 31) | USB_SID;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET USB: SMMU mapped SMR[%u] 0x%08x S2CR 0x%08x (type %u cb %u) sGFSR 0x%08x\n",
++	    freei, usb_rd(s, 0x800 + 4 * freei), usb_rd(s, 0xc00 + 4 * freei),
++	    (usb_rd(s, 0xc00 + 4 * freei) >> 16) & 3, usb_rd(s, 0xc00 + 4 * freei) & 0xff,
++	    usb_rd(s, 0x48));
++	sweet_log_flush();
++}
++
++static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
+-		return;
++	/*
++	 * sweetusbdma=1: reuse ABL's event-buffer page instead of kernel RAM
++	 * (a19 test: crashes at the same point, so not the address itself).
++	 */
++	int abl_dma = 0;
++	(void)PE_parse_boot_argn("sweetusbdma", &abl_dma, sizeof(abl_dma));
++	uint64_t abl_pa = (((uint64_t)dwc_rd(GEVNTADRHI) << 32) | dwc_rd(GEVNTADRLO)) & ~(uint64_t)PAGE_MASK;
++	if (abl_dma && abl_pa >= 0x80000000ull && abl_pa + UD_SIZE <= 0xc0000000ull &&
++	    (ud.dma = ml_io_map_wcomb((vm_offset_t)abl_pa, UD_SIZE)) != 0) {
++		ud.dma_pa = abl_pa;
++		ud.dma_nc = true;
++		bzero((void *)ud.dma, UD_SIZE);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: DMA in ABL window pa 0x%llx (non-cacheable)\n", abl_pa);
++	} else {
++		if (abl_dma) {
++			printf("SWEET USB: ABL GEVNTADR 0x%llx unusable; kernel DMA\n", abl_pa);
++		}
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: no DMA memory\n");
++			return;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
++		ud.dma_pa = ptoa_64(pn);
+ 	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
+-		return;
+-	}
+-	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
++	if (sweet_is_sm8250()) {
++		printf("SWEET USB: aurora stage 4: DCTL 0x%08x DSTS 0x%08x GCTL 0x%08x; soft reset next\n",
++		    dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(GCTL));
++	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+@@ -895,6 +1431,10 @@
+ 		return;
+ 	}
+ 
++	bool au = sweet_is_sm8250();
++#define AU_STAGE(...) do { if (au) { printf(__VA_ARGS__); sweet_log_flush(); } } while (0)
++	AU_STAGE("SWEET USB: aurora stage 5: DMA va %p pa 0x%llx GUSB2PHYCFG 0x%08x; writing event buffer\n",
++	    (void *)ud.dma, ud.dma_pa, dwc_rd(0xc200));
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+@@ -907,6 +1447,8 @@
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
++	AU_STAGE("SWEET USB: aurora stage 6: GEVNT %08x%08x DEVTEN 0x%08x; ep0 commands next\n",
++	    dwc_rd(GEVNTADRHI), dwc_rd(GEVNTADRLO), dwc_rd(DEVTEN));
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+@@ -916,8 +1458,27 @@
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
+ 		return;
+ 	}
++	if (au) {
++		sweet_usb_smmu();
++	}
++	AU_STAGE("SWEET USB: aurora stage 7: ep0 configured; first DMA (setup TRB) next\n");
+ 	dwc_wr(DALEPENA, 0x3);
+-	ud_start_setup();
++	AU_STAGE("SWEET USB: aurora stage 7a: DALEPENA 0x%08x; STARTTRANSFER next\n", dwc_rd(DALEPENA));
++	int noxfer = 0;
++	(void)PE_parse_boot_argn("sweetusbnoxfer", &noxfer, sizeof(noxfer));
++	if (!noxfer) {
++		ud_start_setup();
++	}
++	if (au) {
++		for (int t = 0; t < 5; t++) {
++			printf("SWEET USB: 7b t=%d DEPCMD0 0x%08x GEVNTCOUNT 0x%08x GSTS 0x%08x sGFSR 0x%08x\n",
++			    t, dwc_rd(DEPCMD(0)), dwc_rd(GEVNTCOUNT), dwc_rd(0xc118),
++			    ud_smmu ? usb_rd(ud_smmu, 0x48) : 0xdeadu);
++			delay(50000);
++		}
++		sweet_log_flush();
++	}
++	AU_STAGE("SWEET USB: aurora stage 8: setup TRB started; QSCRATCH next\n");
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+@@ -931,10 +1492,13 @@
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	AU_STAGE("SWEET USB: aurora stage 9: RUN_STOP next\n");
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+ 	}
++	AU_STAGE("SWEET USB: aurora stage 10: running\n");
++#undef AU_STAGE
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1998,6 +1998,37 @@
+ 			(void) task_suspend_internal(task);
+ 		}
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		static char sweet_freeze_names[128];
++		static bool sweet_freeze_init = false;
++		if (!sweet_freeze_init) {
++			if (!PE_parse_boot_argn("sweetfreeze", sweet_freeze_names, sizeof(sweet_freeze_names))) {
++				strlcpy(sweet_freeze_names, "fairplayd.H2,bluetoothd,driverkitd", sizeof(sweet_freeze_names));
++			}
++			sweet_freeze_init = true;
++		}
++		if (sweet_freeze_names[0] != '-') {
++			size_t n = strlen(p->p_name);
++			for (const char *t = sweet_freeze_names; *t;) {
++				const char *end = strchr(t, ',');
++				size_t tl = end ? (size_t)(end - t) : strlen(t);
++				if (tl == n && n > 0 && strncmp(t, p->p_name, n) == 0) {
++					printf("SWEET EXEC: freezing %s[%d]\n", p->p_name, proc_getpid(p));
++					proc_lock(p);
++					p->p_stat = SSTOP;
++					proc_unlock(p);
++					(void) task_suspend_internal(task);
++					break;
++				}
++				if (!end) {
++					break;
++				}
++				t = end + 1;
++			}
++		}
++	}
++#endif
+ 
+ 	/*
+ 	 * mark as execed
+@@ -7412,8 +7443,10 @@
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			/* SWEET runs every iOS binary this way: one short line per exec (skip xpcproxy spam). */
++			if (strcmp(p->p_name, "xpcproxy") != 0) {
++				printf("exec %s\n", p->p_name);
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -149,6 +149,23 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++static AppleCLCD *sweet_fb_instance;
++static uint32_t gLastSurfaceID[SWEET_FB_LAYERS];
++static uint32_t gLastSeed[SWEET_FB_LAYERS];
++static void sweet_fb_fade(AppleCLCD *fb, uint32_t step);
++
++extern "C" void
++sweet_fb_set_hz(uint32_t hz)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	if (fb != NULL) {
++		fb->fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++		bzero(gLastSurfaceID, sizeof(gLastSurfaceID));
++		fb->fDirty = true;
++		IOLog("SWEET FB: set hz=%u (flushTicks=%u)\n", hz, fb->fFlushTicks);
++	}
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -192,9 +209,10 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	sweet_fb_instance = this;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -232,12 +250,7 @@
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
+-			}
++			sweet_fb_fade(fb, step);
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -308,6 +321,73 @@
+ 	}
+ }
+ 
++static void
++sweet_fb_fade(AppleCLCD *fb, uint32_t step)
++{
++	const uint8_t *fPending = fb->fPending;
++	SweetSurface *fSurface = fb->fSurface;
++	int32_t fOffX = fb->fOffX, fOffY = fb->fOffY;
++	uint32_t fWidth = fb->fWidth, fHeight = fb->fHeight, fRowBytes = fb->fRowBytes;
++	uintptr_t fPixels = fb->fPixels;
++	/*
++	 * Never read from fPixels: it is mapped Write-Combine (kIOMapWriteCombineCache),
++	 * so reading 2.59M pixels per frame stalls the CPU for hundreds of ms and
++	 * turns the screen-off animation into a slideshow. Instead, read from the
++	 * cached layer surface in normal RAM, shift in registers, and write 64-bit
++	 * words to fPixels; on step >= 6 (or if no surface), zero-fill fPixels.
++	 */
++	uint32_t shift = step + 1;
++	static const uint64_t masks[7] = {
++		0xffffffffffffffffULL,
++		0x7f7f7f7f7f7f7f7fULL,
++		0x3f3f3f3f3f3f3f3fULL,
++		0x1f1f1f1f1f1f1f1fULL,
++		0x0f0f0f0f0f0f0f0fULL,
++		0x0707070707070707ULL,
++		0x0303030303030303ULL,
++	};
++	bzero(gLastSurfaceID, sizeof(gLastSurfaceID));
++	if (step < 6) {
++		uint32_t mask = get32(fPending, 0x104);
++		for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++			uint32_t id = get32(fPending, 0x54 + 4 * layer);
++			if (!(mask & (1u << layer)) || id == 0) {
++				continue;
++			}
++			SweetSurface *s = sweet_surface_copy(id);
++			if (s == NULL || s == fSurface) {
++				OSSafeReleaseNULL(s);
++				continue;
++			}
++			uintptr_t src = s->kernelAddress();
++			int32_t sx = fOffX > 0 ? fOffX : 0;
++			int32_t sy = fOffY > 0 ? fOffY : 0;
++			int32_t w = (int32_t)fWidth;
++			int32_t h = (int32_t)fHeight;
++			if (w > (int32_t)s->width - sx) w = (int32_t)s->width - sx;
++			if (h > (int32_t)s->height - sy) h = (int32_t)s->height - sy;
++			uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4;
++			if (src != 0 && w > 0 && h > 0 && s->memory != NULL && last <= s->memory->getLength()) {
++				uint64_t m64 = masks[shift <= 6 ? shift : 6];
++				for (int32_t y = 0; y < h; y++) {
++					volatile uint64_t *dst64 = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
++					const uint64_t *src64 = (const uint64_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++					int32_t pairs = w / 2;
++					for (int32_t i = 0; i < pairs; i++) {
++						dst64[i] = (src64[i] >> shift) & m64;
++					}
++				}
++				s->release();
++				return;
++			}
++			s->release();
++		}
++	}
++	for (uint32_t y = 0; y < fHeight; y++) {
++		bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -390,7 +470,13 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		uint32_t seed = (s->state != NULL && s->state->getLength() >= 0x10) ?
++		    *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++		bool unchanged = (mask == (1u << layer)) && gLastSurfaceID[layer] == id &&
++		    seed != 0 && gLastSeed[layer] == seed;
++		if (src != 0 && bpe == 4 && !unchanged) {
++			gLastSurfaceID[layer] = id;
++			gLastSeed[layer] = seed;
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -539,6 +625,7 @@
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
++				bzero(gLastSurfaceID, sizeof(gLastSurfaceID));
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+@@ -568,4 +655,31 @@
+ 	}
+ 	return ret;
+ }
++extern "C" size_t
++sweet_fb_summary(char *buf, size_t max)
++{
++	AppleCLCD *fb = sweet_fb_instance;
++	if (fb == NULL || fb->fPixels == 0) {
++		return snprintf(buf, max, "ERR no fb\n");
++	}
++	size_t o = (size_t)snprintf(buf, max, "OK fb %ux%u off %d,%d power %d\n",
++	    fb->fWidth, fb->fHeight, fb->fOffX, fb->fOffY, fb->fPowerOff ? 1 : 0);
++	const int GX = 12, GY = 24;
++	for (int gy = 0; gy < GY; gy++) {
++		if (o + 8 * GX + 8 > max) {
++			break;
++		}
++		o += (size_t)snprintf(buf + o, max - o, "%02d ", gy);
++		for (int gx = 0; gx < GX; gx++) {
++			uint32_t x = (uint32_t)(((gx * 2 + 1) * (int64_t)fb->fWidth) / (GX * 2));
++			uint32_t y = (uint32_t)(((gy * 2 + 1) * (int64_t)fb->fHeight) / (GY * 2));
++			uint32_t px = *(volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes + (uint64_t)x * 4);
++			o += (size_t)snprintf(buf + o, max - o, "%02x%02x%02x ",
++			    (px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
++		}
++		o += (size_t)snprintf(buf + o, max - o, "\n");
++	}
++	return o;
++}
++
+ #endif /* SWEET */
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -232,10 +232,16 @@
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint64_t sweet_aks_logged;
++	if (ret != kIOReturnSuccess || selector >= 64 || !(sweet_aks_logged & (1ULL << selector))) {
++		if (selector < 64 && ret == kIOReturnSuccess) {
++			sweet_aks_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
