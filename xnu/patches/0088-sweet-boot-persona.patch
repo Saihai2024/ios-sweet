@@ -1,0 +1,68 @@
+Create the uid 501 SYSTEM_PROXY persona at boot.
+
+usermanagerd is the daemon that normally creates personas from its
+keybag-backed manifest, but on the SWEET ramdisk root that manifest
+cannot exist (no effaceable storage), so the daemon aborts ("Daemon
+failed to load persona manifest") and every user/501 session spawn
+logs "kpersona_find_by_type() failed ... Unable to find persona with
+type 6" / "No matching personas of type 6 uid 501, found 1" from
+launchd. Creating the persona from the kernel at bsd_init() mirrors
+what kpersona_alloc_syscall() does and unblocks the launchd lookups;
+usermanagerd itself stays disabled in the image (plist Disabled=true,
+backup com.apple.mobile.usermanagerd.plist.bak-1104).
+
+--- a/bsd/kern/kern_persona.c
++++ b/bsd/kern/kern_persona.c
+@@ -945,6 +945,33 @@ persona_get_uid(struct persona *persona)
+ 	return uid;
+ }
+
++/*
++ * SWEET: create the personas usermanagerd would have created from its
++ * manifest. Mirrors kpersona_alloc_syscall() without the entitlement
++ * check/copyin: see bsd/kern/sys_persona.c.
++ */
++void
++sweet_persona_bootinit(void)
++{
++	size_t found = 0;
++
++	/* idempotent: skip if a SYSTEM_PROXY persona already exists */
++	persona_find_all(NULL, PERSONA_ID_NONE, PERSONA_SYSTEM_PROXY,
++	    NULL, &found);
++	if (found > 0) {
++		return;
++	}
++
++	int error = 0;
++	struct persona *persona = persona_alloc(501, "mobile",
++	    PERSONA_SYSTEM_PROXY, NULL, 501, &error);
++	if (persona == NULL) {
++		printf("SWEET PERSONA: alloc failed: %d\n", error);
++		return;
++	}
++	error = persona_init_begin(persona);
++	persona_init_end(persona, error);
++	printf("SWEET PERSONA: created SYSTEM_PROXY id 501 (mobile), err=%d\n",
++	    error);
++}
++
+ boolean_t
+ persona_is_adoption_allowed(struct persona *persona)
+ {
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1054,6 +1054,11 @@ bsd_init(void)
+ 		sweet_sample_start();
+ 	}
+
++	/* Create the uid 501 SYSTEM_PROXY persona that usermanagerd would
++	 * have created from its (absent, keybag-backed) manifest. */
++	{
++		extern void sweet_persona_bootinit(void);
++		sweet_persona_bootinit();
++	}
++
+ 	pal_kernel_announce();
+
+ 	bsd_init_kprintf("calling mountroot_post_hook\n");
