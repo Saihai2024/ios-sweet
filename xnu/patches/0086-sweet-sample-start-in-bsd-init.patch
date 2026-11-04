@@ -1,26 +1,40 @@
 Start the SWEET process sampler from bsd_init() as well, not only from
 sweet_ufs attach: when the root is a ramdisk (rd=md0, e.g. qbig QEMU
 boots) there is no sweet_ufs LUN, so sweetsample= never produced any
-output. The start call is idempotent: `started` is set only when
-kernel_thread_start() succeeds, so a failed start (raced during early
-bsd_init, seen as qr64 printing no SMP at all while qr63 did) is retried
-on the next call instead of disabling the sampler forever.
+output. The start call is idempotent and retries for up to 30 seconds:
+kernel_thread_start() during early bsd_init was observed to fail
+transiently (some runs print SMP output, otherwise-identical runs print
+none), and a single-shot start silently disabled the sampler for the
+whole boot. Each attempt prints its outcome so the fb console proves
+whether the thread came up.
 
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -82,8 +82,13 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -81,8 +81,22 @@
  void
  sweet_sample_start(void)
  {
  	thread_t thread;
+-	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
 +	static bool started;
++	int i;
++
 +	if (started) {
 +		return;  /* bsd_init and sweet_ufs attach may both call us */
 +	}
- 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
-+		started = true;
- 		thread_deallocate(thread);
- 	}
++	for (i = 0; i < 30; i++) {
++		if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++			started = true;
++			thread_deallocate(thread);
++			printf("SWEET SMP: sampler thread started (attempt %d)\n", i);
++			return;
++		}
++		/* early bsd_init can transiently refuse to spawn threads */
++		delay(1000000);  /* 1 s in usec */
++	}
++	printf("SWEET SMP: sampler thread FAILED to start after %d attempts\n", i);
  }
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
