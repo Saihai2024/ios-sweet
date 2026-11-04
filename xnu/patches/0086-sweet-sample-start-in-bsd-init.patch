@@ -1,11 +1,14 @@
 Start the SWEET process sampler from bsd_init() as well, not only from
 sweet_ufs attach: when the root is a ramdisk (rd=md0, e.g. qbig QEMU
 boots) there is no sweet_ufs LUN, so sweetsample= never produced any
-output. The start call is idempotent; whichever path runs first wins.
+output. The start call is idempotent: `started` is set only when
+kernel_thread_start() succeeds, so a failed start (raced during early
+bsd_init, seen as qr64 printing no SMP at all while qr63 did) is retried
+on the next call instead of disabling the sampler forever.
 
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -82,8 +82,13 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -82,8 +82,14 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  void
  sweet_sample_start(void)
  {
@@ -14,8 +17,8 @@ output. The start call is idempotent; whichever path runs first wins.
 +	if (started) {
 +		return;  /* bsd_init and sweet_ufs attach may both call us */
 +	}
-+	started = true;
  	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		started = true;
  		thread_deallocate(thread);
  	}
  }
@@ -25,15 +28,15 @@ output. The start call is idempotent; whichever path runs first wins.
  	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
  	bsd_utaskbootstrap();
 
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/* Start the SWEET process sampler even when the root is a ramdisk
 +	 * (rd=md0, no sweet_ufs LUN): see bsd/dev/sweet_sample.c.
-+	 * The call is idempotent. */
++	 * The call is idempotent. (No #ifdef: ARM64_BOARD_CONFIG_SWEET is
++	 * not defined in this translation unit, so a plain #ifdef compiled
++	 * the call out.) */
 +	{
 +		extern void sweet_sample_start(void);
 +		sweet_sample_start();
 +	}
-+#endif
 +
  	pal_kernel_announce();
 
