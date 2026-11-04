@@ -1,0 +1,22 @@
+Sample more often: first sample 30 s after start (was 90 s), then every
+15 s (was 120 s), 80 samples max. On the QEMU fb console launchd spam
+scrolls dozens of lines per second, so a 120 s cadence almost never
+leaves an SMP block visible in a snapshot; a 15 s cadence keeps sampler
+output on screen most of the time.
+
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -70,10 +70,10 @@
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
++	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
++	for (int i = 0; i < 80; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 15 * hz);
+ 	}
+ }
