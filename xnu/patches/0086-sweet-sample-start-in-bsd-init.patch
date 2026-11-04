@@ -8,7 +8,7 @@ on the next call instead of disabling the sampler forever.
 
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -82,8 +82,14 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -82,8 +82,13 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  void
  sweet_sample_start(void)
  {
@@ -24,7 +24,7 @@ on the next call instead of disabling the sampler forever.
  }
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -1044,6 +1044,16 @@ bsd_init(void)
+@@ -1044,7 +1044,17 @@ bsd_init(void)
  	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
  	bsd_utaskbootstrap();
 

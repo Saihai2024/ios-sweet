@@ -13,7 +13,7 @@ backup com.apple.mobile.usermanagerd.plist.bak-1104).
 
 --- a/bsd/kern/kern_persona.c
 +++ b/bsd/kern/kern_persona.c
-@@ -945,6 +945,33 @@ persona_get_uid(struct persona *persona)
+@@ -945,6 +945,36 @@ persona_get_uid(struct persona *persona)
  	return uid;
  }
 
@@ -52,7 +52,7 @@ backup com.apple.mobile.usermanagerd.plist.bak-1104).
  {
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -1054,6 +1054,11 @@ bsd_init(void)
+@@ -1054,7 +1054,14 @@ bsd_init(void)
  		sweet_sample_start();
  	}
 
