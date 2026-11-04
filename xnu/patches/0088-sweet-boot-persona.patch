@@ -52,7 +52,7 @@ backup com.apple.mobile.usermanagerd.plist.bak-1104).
  {
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -1054,7 +1054,14 @@ bsd_init(void)
+@@ -1054,6 +1054,13 @@
  		sweet_sample_start();
  	}
 
