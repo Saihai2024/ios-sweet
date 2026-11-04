@@ -6,7 +6,7 @@ output on screen most of the time.
 
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -70,10 +70,10 @@
+@@ -70,11 +70,11 @@
  	if (sweet_sample_names[0] == '-') {
  		return;
  	}
@@ -20,3 +20,4 @@ output on screen most of the time.
 +		(void)tsleep(&chan, PZERO, "sweetsmp", 15 * hz);
  	}
  }
+ 
