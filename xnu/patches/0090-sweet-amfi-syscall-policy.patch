@@ -1,6 +1,6 @@
-diff --git a/xnu/bsd/kern/sweet_amfi.c b/xnu/bsd/kern/sweet_amfi.c
---- a/xnu/bsd/kern/sweet_amfi.c
-+++ b/xnu/bsd/kern/sweet_amfi.c
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
 @@ -351,6 +351,79 @@
  	.mpo_priv_grant = sweet_sandbox_priv_grant,
  };
