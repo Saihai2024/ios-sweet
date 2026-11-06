@@ -1,0 +1,92 @@
+diff --git a/xnu/bsd/kern/sweet_amfi.c b/xnu/bsd/kern/sweet_amfi.c
+--- a/xnu/bsd/kern/sweet_amfi.c
++++ b/xnu/bsd/kern/sweet_amfi.c
+@@ -351,6 +351,79 @@
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
+ };
+ 
++/*
++ * Policy "AMFI": userland asks the AMFI kext for entitlement decisions
++ * through __mac_syscall("AMFI", call, struct). Without a policy of that
++ * name every call fails with ENOPOLICY and every entitlement query in
++ * userland fails: QuartzCore's CADisplayStateControl stays nil ("this
++ * process needs entitlement: com.apple.QuartzCore.display-state"), so
++ * CoreBrightness's OSDI display-mode transition never completes and its
++ * CB_DM watchdog kills SpringBoard, and libxpc treats every check as a
++ * mismatch. Call 0x66 is the entitlement check; libxpc builds the struct
++ * as (from its disassembly):
++ *   +0x00 32 bytes  constraint / match-result area (left unchanged)
++ *   +0x20 user char *name, +0x28 uint32 name_len
++ *   +0x30 user int *result (nonzero = match), +0x38 0x404
++ * The answer comes from the process's own code-signature entitlements.
++ * Every other call number keeps returning ENOPOLICY, logged on first use.
++ */
++static uint64_t sweet_amfi_seen_calls;
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		char            opaque[32];
++		user_addr_t     name;
++		uint32_t        len;
++		uint32_t        pad;
++		user_addr_t     out;
++		uint32_t        magic;
++	} req;
++	char name[192];
++	char pname[32];
++	int match = 0;
++
++	if (call != 0x66) {
++		if (call >= 0 && call < 64 && !(sweet_amfi_seen_calls & (1ULL << call))) {
++			sweet_amfi_seen_calls |= 1ULL << call;
++			proc_name(proc_pid(p), pname, sizeof(pname));
++			printf("SWEET AMFI: %s syscall %d (unhandled)\n", pname, call);
++		}
++		return ENOPOLICY;
++	}
++	if (copyin(arg, (char *)&req, sizeof(req)) != 0) {
++		return EFAULT;
++	}
++	if (req.len == 0 || req.len >= sizeof(name)) {
++		return EINVAL;
++	}
++	if (copyin(req.name, name, req.len) != 0) {
++		return EFAULT;
++	}
++	name[req.len] = '\0';
++	const void *ent = sweet_proc_entitlements(p);
++	if (ent != NULL) {
++		match = sweet_entitlements_bool(ent, name) ? 1 : 0;
++	}
++	if (copyout(&match, req.out, sizeof(match)) != 0) {
++		return EFAULT;
++	}
++	return 0;
++}
++
++static const struct mac_policy_ops sweet_amfi_syscall_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_syscall_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI syscall stand-in",
++	.mpc_ops = &sweet_amfi_syscall_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_syscall_mac_handle;
++
+ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ 	.mpc_name = "Sandbox",
+ 	.mpc_fullname = "SWEET permissive sandbox stand-in",
+@@ -379,5 +452,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_syscall_mac_conf, &sweet_amfi_syscall_mac_handle, NULL);
++	printf("SWEET AMFI: syscall policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
